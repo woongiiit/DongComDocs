@@ -1,6 +1,14 @@
 const TOKEN_KEY = "dongcomdocs_token";
 
-const API_BASE = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, "") ?? "";
+/** Railway Variables에 https 없이 호스트만 넣은 경우도 절대 URL로 보정 */
+function normalizeApiBase(raw: string | undefined): string {
+  const trimmed = raw?.trim().replace(/\/$/, "") ?? "";
+  if (!trimmed) return "";
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  return `https://${trimmed}`;
+}
+
+const API_BASE = normalizeApiBase(import.meta.env.VITE_API_URL as string | undefined);
 
 export function getApiBase(): string {
   return API_BASE;
