@@ -87,6 +87,41 @@ export function sanitizeFieldKeyCandidate(raw: string): string | null {
   return s;
 }
 
+/**
+ * 중복·포함 관계 필드 정리. 예: `학과`+`지원학과` → `지원학과`만, `현소속`+`현소속_2` → `현소속`만.
+ */
+export function collapseOverlappingFieldKeys(fields: string[]): string[] {
+  const list = [...fields];
+  const drop = new Set<string>();
+
+  for (const f of list) {
+    if (drop.has(f)) continue;
+    const tail = fieldKeyTailForMatch(f).replace(/\s+/g, "");
+    if (!tail) continue;
+
+    for (const g of list) {
+      if (f === g || drop.has(f)) continue;
+      const gt = fieldKeyTailForMatch(g).replace(/\s+/g, "");
+      if (!gt) continue;
+
+      if (tail === gt) {
+        if (/_\d+$/.test(f) && !/_\d+$/.test(g)) drop.add(f);
+        else if (/_\d+$/.test(g) && !/_\d+$/.test(f)) drop.add(g);
+        continue;
+      }
+
+      if (tail.length >= 2 && tail.length <= 10 && gt.length > tail.length && gt.includes(tail)) {
+        const fBare = !f.includes("_") || /_\d+$/.test(f);
+        if (fBare && (gt.endsWith(tail) || tail.length <= 4)) {
+          drop.add(f);
+        }
+      }
+    }
+  }
+
+  return list.filter((f) => !drop.has(f));
+}
+
 export function normalizeSchemaFieldKeys(
   input: string[],
   context: string
@@ -96,7 +131,7 @@ export function normalizeSchemaFieldKeys(
   const out: string[] = [];
   let confirmCounter = 0;
 
-  for (const raw of input) {
+  for (const raw of collapseOverlappingFieldKeys(input)) {
     if (out.length >= MAX_SCHEMA_FIELDS) break;
     const base = normalizeFieldListItem(raw);
     if (!base) {
@@ -447,15 +482,16 @@ export function matchFieldKeysToWordBboxesWithUsed(
   const usedWordIndices = new Set<number>();
   const out: FieldBox[] = [];
 
+  const clamp = (v: number) => Math.max(0, Math.min(1, v));
+
   for (const key of fields) {
     const tailRaw = fieldKeyTailForMatch(key);
     const nk = normalizeLabelForMatch(tailRaw);
     if (!nk) continue;
 
-    const hasSectionPrefix = key.includes("_");
     const longTail = nk.length > FIELD_TAIL_LONG_FOR_EXACT_MATCH;
 
-    if (hasSectionPrefix && !longTail) {
+    if (!longTail) {
       const chain = findConsecutiveRowMatchIndices(indexed, usedWordIndices, nk);
       if (chain?.length) {
         for (const idx of chain) usedWordIndices.add(idx);
@@ -470,7 +506,6 @@ export function matchFieldKeysToWordBboxesWithUsed(
           maxX = Math.max(maxX, w.x + w.w);
           maxY = Math.max(maxY, w.y + w.h);
         }
-        const clamp = (v: number) => Math.max(0, Math.min(1, v));
         out.push({
           key,
           x: clamp(minX),
@@ -485,69 +520,19 @@ export function matchFieldKeysToWordBboxesWithUsed(
     }
 
     const pool = indexed.filter((w) => !usedWordIndices.has(w.idx));
-    const candidates = pool.filter((w) => {
-      const nw = normalizeLabelForMatch(w.text);
-      if (!nw) return false;
-      if (longTail) return nw === nk;
-      if (nw === nk) return true;
-      if (nw.length >= 2 && nk.length >= 2 && (nw.includes(nk) || nk.includes(nw))) {
-        if (nk.length >= 2 && nw.length === 1) return false;
-        const shorter = Math.min(nw.length, nk.length);
-        const longer = Math.max(nw.length, nk.length);
-        if (shorter < 3 && longer / shorter > 2.5) return false;
-        return true;
-      }
-      return false;
-    });
-
+    const candidates = pool.filter((w) => normalizeLabelForMatch(w.text) === nk);
     if (!candidates.length) continue;
 
-    if (hasSectionPrefix) {
-      const sorted = [...candidates].sort(readingOrderSort);
-      const exact = sorted.filter((w) => normalizeLabelForMatch(w.text) === nk);
-      const pickPool = exact.length ? exact : sorted;
-      const textLen = (w: (typeof indexed)[number]) => normalizeLabelForMatch(w.text).length;
-      const chosen = [...pickPool].sort((a, b) => textLen(b) - textLen(a))[0]!;
-      usedWordIndices.add(chosen.idx);
-      const clamp = (v: number) => Math.max(0, Math.min(1, v));
-      out.push({
-        key,
-        x: clamp(chosen.x),
-        y: clamp(chosen.y),
-        w: clamp(chosen.w),
-        h: clamp(chosen.h),
-        matchCount: 1,
-        matchedWord: chosen.text,
-      });
-      continue;
-    }
-
-    let minX = Infinity;
-    let minY = Infinity;
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-    for (const c of candidates) {
-      usedWordIndices.add(c.idx);
-      minX = Math.min(minX, c.x);
-      minY = Math.min(minY, c.y);
-      maxX = Math.max(maxX, c.x + c.w);
-      maxY = Math.max(maxY, c.y + c.h);
-    }
-
-    const clamp = (v: number) => Math.max(0, Math.min(1, v));
-    const x = clamp(minX);
-    const y = clamp(minY);
-    const w = clamp(maxX - minX);
-    const h = clamp(maxY - minY);
-
+    const chosen = [...candidates].sort(readingOrderSort)[0]!;
+    usedWordIndices.add(chosen.idx);
     out.push({
       key,
-      x,
-      y,
-      w,
-      h,
-      matchCount: candidates.length,
-      matchedWord: candidates.map((c) => c.text).join(" | "),
+      x: clamp(chosen.x),
+      y: clamp(chosen.y),
+      w: clamp(chosen.w),
+      h: clamp(chosen.h),
+      matchCount: 1,
+      matchedWord: chosen.text,
     });
   }
 
@@ -1055,6 +1040,15 @@ export function getTemplateAnalysisMode(): TemplateAnalysisMode {
   if (raw === "vision" || raw === "vlm" || raw === "image") return "vision";
   if (raw === "auto") return "auto";
   return "text_first";
+}
+
+/** text_first·auto(텍스트 경로) 성공 후 PDF 단어 레이어로 필드 추가. 기본 off, vision은 on. */
+export function pdfWordAugmentEnabled(opts?: { fromTextFirst?: boolean }): boolean {
+  const v = process.env.PDF_WORD_AUGMENT?.trim().toLowerCase();
+  if (v === "1" || v === "true" || v === "yes" || v === "on") return true;
+  if (v === "0" || v === "false" || v === "no" || v === "off") return false;
+  if (opts?.fromTextFirst) return false;
+  return getTemplateAnalysisMode() !== "text_first";
 }
 
 /** 문서 제목·양식명이 필드로 잘못 들어온 `섹션_*` 조각 */
@@ -2020,6 +2014,12 @@ const TEMPLATE_TEXT_FIRST_SCHEMA = [
   "- `섹션_` 접두사를 붙이지 않는다. 같은 라벨이 여러 구역에 있을 때만 `구역명_라벨` 형태(예: 지원구분_성명).",
   "- 괄호 안 부연·※·'해당시에만'·'1부'·'발급본'은 제외한다.",
   "- layout_hierarchy·bbox는 출력하지 않는다.",
+  "",
+  "# 표·한 행 라벨",
+  "- 표 한 칸(셀)의 라벨을 **하나의 필드**로 쓴다. '현 소속'·'단과대학'·'학과'처럼 한 행에 나란히 있는 짧은 라벨은 각각 별도 필드로 나열한다.",
+  "- 본문에서 띄어쓴 한 라벨(예: '현 소속')은 필드명에서 공백 없이 붙여 쓴다(예: 현소속).",
+  "- 같은 의미의 짧은 꼬리만 다른 필드는 넣지 않는다. 이미 '지원학과'가 있으면 '학과'만 단독으로 넣지 않는다.",
+  "- 동일 라벨의 `_2`, `_3` 접미사는 만들지 않는다.",
 ].join("\n");
 
 const TEMPLATE_SIMPLE_VISION_SCHEMA = [
@@ -2053,7 +2053,9 @@ function templateResultFromFieldsParsed(
   context: string
 ): TemplateAnalysisResult {
   const rawFieldItems = extractRawFieldsArrayFromParsed(parsed);
-  let fields = rawFieldItems.map(normalizeFieldListItem).filter((s): s is string => Boolean(s));
+  let fields = collapseOverlappingFieldKeys(
+    rawFieldItems.map(normalizeFieldListItem).filter((s): s is string => Boolean(s))
+  );
   const summary =
     String(parsed.summary ?? "").trim() ||
     String(parsed.document_type ?? "").trim() ||
@@ -2076,8 +2078,10 @@ export async function analyzeTemplateWithVllm(
 
   const mode = getTemplateAnalysisMode();
   const docTypeHint = buildTemplateDocTypeHint(docType);
-  const finish = (r: TemplateAnalysisResult) =>
-    augmentTemplateFieldsFromPdfWordLayer(pdfAbsPath, getVllmTemplateRenderScale(), r);
+  const finish = (r: TemplateAnalysisResult, fromTextFirst = false) =>
+    pdfWordAugmentEnabled({ fromTextFirst })
+      ? augmentTemplateFieldsFromPdfWordLayer(pdfAbsPath, getVllmTemplateRenderScale(), r)
+      : r;
 
   const minFieldsRaw = process.env.TEXT_FIRST_MIN_FIELDS?.trim();
   const minFields = minFieldsRaw ? Math.max(3, Number(minFieldsRaw) || 6) : 6;
@@ -2142,6 +2146,8 @@ export async function analyzeTemplateWithVllm(
       "",
       "# 이번 요청",
       "위 본문만 보고 입력란·표의 항목 라벨을 fields 배열로 나열한다.",
+      "표 한 행의 '현 소속·단과대학·학과'처럼 나란히 있는 라벨은 각각 하나씩, 공백은 제거해 필드명으로 쓴다.",
+      "지원학과·지원전공 등 구체적인 이름이 있으면 짧은 '학과'만 단독으로 넣지 않는다.",
       "일반적인 지원서에는 보통 8개 이상의 서로 다른 항목명이 있다.",
     ].join("\n");
     const maxTok = Math.min(4096, getVllmTemplateMaxOutputTokens(baseUrl));
@@ -2201,7 +2207,7 @@ export async function analyzeTemplateWithVllm(
   if (mode === "text_first" || mode === "auto") {
     try {
       const textResult = await runTextFirst();
-      if (textResult) return finish(textResult);
+      if (textResult) return finish(textResult, true);
     } catch (e) {
       console.warn("[template-analyze] text_first failed", e);
     }
