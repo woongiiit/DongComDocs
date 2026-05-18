@@ -1,7 +1,8 @@
 FROM node:20-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm ci 2>/dev/null || npm install
+# postinstall(prisma generate)는 prisma/ 복사 전이므로 스크립트 생략 — build 단계에서 generate
+RUN npm ci --ignore-scripts 2>/dev/null || npm install --ignore-scripts
 
 FROM node:20-alpine AS build
 WORKDIR /app
