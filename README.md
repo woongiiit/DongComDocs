@@ -75,7 +75,8 @@ npm run dev:web
 ## Railway 배포 메모
 
 - DB: Railway PostgreSQL 플러그인 연결 후 `DATABASE_URL` 설정.
-- 서비스 2개: Root Directory 각각 `apps/web`, `apps/api`.
+- 서비스 2개: **Settings → Root Directory** 를 각각 `apps/api`, `apps/web` 로 지정 (루트(`.`)로 두면 `No start command detected` 빌드 실패).
+- 각 서비스는 `apps/*/railway.toml` 로 Dockerfile 빌드를 사용합니다.
 - API에 `JWT_SECRET`, `ADMIN_ID`, 프론트 도메인에 맞춘 `CORS_ORIGIN` 설정.
 - 웹 빌드 산출물은 정적 호스팅 또는 `vite preview`/Node 정적 서버로 서빙.
 
