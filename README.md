@@ -79,7 +79,10 @@ npm run dev:web
 - **API** (`DongComDocs_Backend` 등): Root Directory = `apps/api` — `DATABASE_URL` 등 API 변수 필요.
 - **Web** (`DoncComDocs_Front` 등): Root Directory = `apps/web` — **DATABASE_URL 불필요**. 루트(`.`)로 두면 API `start:prod`가 실행되어 `DATABASE_URL is not set` 로 크래시함.
 - Web 빌드 시 Docker ARG: `VITE_API_URL=https://<api-공개-URL>`
-- 각 서비스는 `apps/*/railway.toml` 로 Dockerfile 빌드를 사용합니다.
+- 각 서비스 **Settings → Config-as-code 파일 경로** (저장소 루트 기준 절대 경로):
+  - API: `/apps/api/railway.json`
+  - Web: `/apps/web/railway.json`
+- **Settings → Build → Builder** 가 `Dockerfile` 인지 확인 (Railpack이면 Web 빌드가 실패할 수 있음).
 - API에 `JWT_SECRET`, `ADMIN_ID`, 프론트 도메인에 맞춘 `CORS_ORIGIN` 설정.
 - 웹 빌드 산출물은 정적 호스팅 또는 `vite preview`/Node 정적 서버로 서빙.
 
