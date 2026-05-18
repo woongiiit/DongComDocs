@@ -122,6 +122,131 @@ export function collapseOverlappingFieldKeys(fields: string[]): string[] {
   return list.filter((f) => !drop.has(f));
 }
 
+type PdfWordBox = { text: string; x: number; y: number; w: number; h: number };
+
+/** 두 bbox의 가로 겹침 비율(union 기준). */
+function boxesOverlapXRatio(
+  a: { x0: number; x1: number },
+  b: { x0: number; x1: number }
+): number {
+  const inter = Math.max(0, Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0));
+  const union = Math.max(a.x1, b.x1) - Math.min(a.x0, b.x0);
+  return union > 1e-6 ? inter / union : 0;
+}
+
+const VERTICAL_STACK_MAX_Y_GAP = 0.038;
+const VERTICAL_STACK_MIN_X_OVERLAP = 0.42;
+const VERTICAL_STACK_MAX_PART_CHARS = 10;
+
+/**
+ * 같은 표 칸 안 세로 2줄 라벨(예: 졸업 + 기준학점)을 하나의 필드로 합친다.
+ * PDF 단어 bbox의 x 겹침·y 간격으로 판별한다.
+ */
+export function mergeVerticallyStackedFieldKeys(fields: string[], words: PdfWordBox[]): string[] {
+  if (fields.length < 2 || !words.length) return fields;
+
+  type Anchor = {
+    fieldIdx: number;
+    key: string;
+    wi: number;
+    x0: number;
+    y0: number;
+    x1: number;
+    y1: number;
+  };
+  const anchors: Anchor[] = [];
+  const usedWord = new Set<number>();
+
+  for (let fi = 0; fi < fields.length; fi++) {
+    const key = fields[fi]!;
+    const nk = normalizeLabelForMatch(fieldKeyTailForMatch(key));
+    if (!nk || nk.length > VERTICAL_STACK_MAX_PART_CHARS) continue;
+    for (let wi = 0; wi < words.length; wi++) {
+      if (usedWord.has(wi)) continue;
+      const w = words[wi]!;
+      if (normalizeLabelForMatch(w.text) !== nk) continue;
+      anchors.push({
+        fieldIdx: fi,
+        key,
+        wi,
+        x0: w.x,
+        y0: w.y,
+        x1: w.x + w.w,
+        y1: w.y + w.h,
+      });
+      usedWord.add(wi);
+      break;
+    }
+  }
+
+  if (anchors.length < 2) return fields;
+
+  const dropField = new Set<number>();
+  const replaceField = new Map<number, string>();
+
+  for (let i = 0; i < anchors.length; i++) {
+    const upper = anchors[i]!;
+    if (dropField.has(upper.fieldIdx)) continue;
+
+    for (let j = i + 1; j < anchors.length; j++) {
+      const lower = anchors[j]!;
+      if (dropField.has(lower.fieldIdx)) continue;
+      if (upper.fieldIdx === lower.fieldIdx) continue;
+
+      const yGap = lower.y0 - upper.y1;
+      if (yGap < -0.008 || yGap > VERTICAL_STACK_MAX_Y_GAP) continue;
+      if (boxesOverlapXRatio(upper, lower) < VERTICAL_STACK_MIN_X_OVERLAP) continue;
+
+      const partA = fieldKeyTailForMatch(upper.key).replace(/\s+/g, "");
+      const partB = fieldKeyTailForMatch(lower.key).replace(/\s+/g, "");
+      if (!partA || !partB) continue;
+      if (partA.length > VERTICAL_STACK_MAX_PART_CHARS || partB.length > VERTICAL_STACK_MAX_PART_CHARS) {
+        continue;
+      }
+
+      const merged = sanitizeFieldKeyCandidate(partA + partB);
+      if (!merged) continue;
+
+      replaceField.set(upper.fieldIdx, merged);
+      dropField.add(lower.fieldIdx);
+      console.info("[template-analyze] vertical stack merge", {
+        from: [upper.key, lower.key],
+        to: merged,
+        yGap: Math.round(yGap * 1000) / 1000,
+      });
+      break;
+    }
+  }
+
+  if (!dropField.size) return fields;
+
+  const out: string[] = [];
+  for (let fi = 0; fi < fields.length; fi++) {
+    if (dropField.has(fi)) continue;
+    out.push(replaceField.get(fi) ?? fields[fi]!);
+  }
+  return out;
+}
+
+function applyVerticalStackMergeToFields(
+  fields: string[],
+  pdfAbsPath: string | null | undefined,
+  scale: number
+): string[] {
+  if (!pdfAbsPath || !fs.existsSync(pdfAbsPath) || fields.length < 2) return fields;
+  try {
+    const words = extractFirstPageWordBboxesNormalized(pdfAbsPath, scale);
+    const merged = mergeVerticallyStackedFieldKeys(fields, words);
+    if (merged.length === fields.length && merged.every((f, i) => f === fields[i])) {
+      return fields;
+    }
+    const { fields: norm } = normalizeTemplateSchemaFields(merged, "verticalStackMerge");
+    return norm;
+  } catch {
+    return fields;
+  }
+}
+
 export function normalizeSchemaFieldKeys(
   input: string[],
   context: string,
@@ -475,6 +600,81 @@ function findConsecutiveRowMatchIndices(
   return null;
 }
 
+/**
+ * 같은 열(x 밴드)에서 세로로 이어 붙은 단어로 필드 꼬리와 일치하는지 찾는다.
+ * 예: 졸업 + 기준학점 → 졸업기준학점
+ */
+function findConsecutiveColMatchIndices(
+  indexed: { text: string; x: number; y: number; w: number; h: number; idx: number }[],
+  usedWordIndices: Set<number>,
+  nk: string
+): number[] | null {
+  const avail = indexed.filter((w) => !usedWordIndices.has(w.idx));
+  if (!avail.length) return null;
+
+  const buckets = new Map<number, typeof avail>();
+  for (const w of avail) {
+    const xc = w.x + w.w * 0.5;
+    const key = Math.round(xc * 420);
+    const list = buckets.get(key) ?? [];
+    list.push(w);
+    buckets.set(key, list);
+  }
+
+  const MAX_V_GAP = 0.045;
+  for (const bk of [...buckets.keys()].sort((a, b) => a - b)) {
+    const colWords = buckets.get(bk)!.sort((a, b) => a.y - b.y);
+    const n = colWords.length;
+    for (let i = 0; i < n; i++) {
+      let acc = "";
+      const chain: number[] = [];
+      for (let j = i; j < n && j < i + 8; j++) {
+        const w = colWords[j]!;
+        if (chain.length) {
+          const prev = colWords[j - 1]!;
+          if (w.y - (prev.y + prev.h) > MAX_V_GAP) break;
+        }
+        acc += normalizeLabelForMatch(w.text);
+        chain.push(w.idx);
+        if (acc === nk) return chain;
+        if (acc.length > nk.length || !nk.startsWith(acc)) break;
+      }
+    }
+  }
+  return null;
+}
+
+function pushMergedWordChainBox(
+  key: string,
+  chain: number[],
+  indexed: { text: string; x: number; y: number; w: number; h: number; idx: number }[],
+  usedWordIndices: Set<number>,
+  out: FieldBox[],
+  clamp: (v: number) => number
+): void {
+  for (const idx of chain) usedWordIndices.add(idx);
+  const ws = chain.map((i) => indexed[i]!);
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const w of ws) {
+    minX = Math.min(minX, w.x);
+    minY = Math.min(minY, w.y);
+    maxX = Math.max(maxX, w.x + w.w);
+    maxY = Math.max(maxY, w.y + w.h);
+  }
+  out.push({
+    key,
+    x: clamp(minX),
+    y: clamp(minY),
+    w: clamp(maxX - minX),
+    h: clamp(maxY - minY),
+    matchCount: 1,
+    matchedWord: ws.map((z) => z.text).join(""),
+  });
+}
+
 /** `matchFieldKeysToWordBboxes`와 동일하되, 매칭에 쓰인 단어 인덱스를 함께 반환한다. */
 export function matchFieldKeysToWordBboxesWithUsed(
   fields: string[],
@@ -494,29 +694,14 @@ export function matchFieldKeysToWordBboxesWithUsed(
     const longTail = nk.length > FIELD_TAIL_LONG_FOR_EXACT_MATCH;
 
     if (!longTail) {
-      const chain = findConsecutiveRowMatchIndices(indexed, usedWordIndices, nk);
-      if (chain?.length) {
-        for (const idx of chain) usedWordIndices.add(idx);
-        const ws = chain.map((i) => indexed[i]!);
-        let minX = Infinity;
-        let minY = Infinity;
-        let maxX = -Infinity;
-        let maxY = -Infinity;
-        for (const w of ws) {
-          minX = Math.min(minX, w.x);
-          minY = Math.min(minY, w.y);
-          maxX = Math.max(maxX, w.x + w.w);
-          maxY = Math.max(maxY, w.y + w.h);
-        }
-        out.push({
-          key,
-          x: clamp(minX),
-          y: clamp(minY),
-          w: clamp(maxX - minX),
-          h: clamp(maxY - minY),
-          matchCount: 1,
-          matchedWord: ws.map((z) => z.text).join(""),
-        });
+      const colChain = findConsecutiveColMatchIndices(indexed, usedWordIndices, nk);
+      if (colChain?.length) {
+        pushMergedWordChainBox(key, colChain, indexed, usedWordIndices, out, clamp);
+        continue;
+      }
+      const rowChain = findConsecutiveRowMatchIndices(indexed, usedWordIndices, nk);
+      if (rowChain?.length) {
+        pushMergedWordChainBox(key, rowChain, indexed, usedWordIndices, out, clamp);
         continue;
       }
     }
@@ -818,7 +1003,10 @@ export function buildTemplateFieldBoxes(
     words = [];
   }
   const wordNormSet = new Set(words.map((w) => normalizeLabelForMatch(w.text)));
-  const normalizedFields = Array.from(new Set(fields.map((k) => remapFieldKeyByWords(k, wordNormSet))));
+  let mergedFields = words.length ? mergeVerticallyStackedFieldKeys(fields, words) : fields;
+  const normalizedFields = Array.from(
+    new Set(mergedFields.map((k) => remapFieldKeyByWords(k, wordNormSet)))
+  );
   const normalizedVlmBboxes = vlmBboxes.map((b) => ({ ...b, key: remapFieldKeyByWords(b.key, wordNormSet) }));
   const vlmByKey = new Map(normalizedVlmBboxes.map((b) => [b.key, b]));
   const matched = matchFieldKeysToWordBboxes(normalizedFields, words);
@@ -2070,8 +2258,14 @@ function bootstrapTemplateFieldsFromPdfLabels(pdfAbsPath: string): TemplateAnaly
     const key = sanitizeFieldKeyCandidate(c.replace(/\s+/g, ""));
     if (key) raw.push(key);
   }
-  const unique = [...new Set(raw)];
+  let unique = [...new Set(raw)];
   if (unique.length < 4) return null;
+  try {
+    const words = extractFirstPageWordBboxesNormalized(pdfAbsPath, getVllmTemplateRenderScale());
+    unique = mergeVerticallyStackedFieldKeys(unique, words);
+  } catch {
+    // words 없으면 span 단위 목록 그대로 사용
+  }
   const { fields } = normalizeTemplateSchemaFields(unique, "pdfLabelBootstrap");
   if (fields.length < 4) return null;
   console.info("[template-analyze] pdf label bootstrap", {
@@ -2094,7 +2288,9 @@ const TEMPLATE_TEXT_FIRST_SCHEMA = [
   "- layout_hierarchy·bbox는 출력하지 않는다.",
   "",
   "# 표·한 행 라벨",
-  "- 표 한 칸(셀)의 라벨을 **하나의 필드**로 쓴다. '현 소속'·'단과대학'·'학과'처럼 한 행에 나란히 있는 짧은 라벨은 각각 별도 필드로 나열한다.",
+  "- 표 한 칸(셀)의 라벨을 **하나의 필드**로 쓴다.",
+  "- 한 칸 안에서 줄바꿈된 라벨(예: '졸업' 다음 줄 '기준학점')은 **졸업기준학점**처럼 하나로 합친다.",
+  "- '현 소속'·'단과대학'·'학과'처럼 **가로로 나란한** 칸은 각각 별도 필드로 나열한다.",
   "- 본문에서 띄어쓴 한 라벨(예: '현 소속')은 필드명에서 공백 없이 붙여 쓴다(예: 현소속).",
   "- 같은 의미의 짧은 꼬리만 다른 필드는 넣지 않는다. 이미 '지원학과'가 있으면 '학과'만 단독으로 넣지 않는다.",
   "- 동일 라벨의 `_2`, `_3` 접미사는 만들지 않는다.",
@@ -2156,10 +2352,21 @@ export async function analyzeTemplateWithVllm(
 
   const mode = getTemplateAnalysisMode();
   const docTypeHint = buildTemplateDocTypeHint(docType);
-  const finish = (r: TemplateAnalysisResult, fromTextFirst = false) =>
-    pdfWordAugmentEnabled({ fromTextFirst })
-      ? augmentTemplateFieldsFromPdfWordLayer(pdfAbsPath, getVllmTemplateRenderScale(), r)
-      : r;
+  const finish = (r: TemplateAnalysisResult, fromTextFirst = false) => {
+    const scale = getVllmTemplateRenderScale();
+    let result: TemplateAnalysisResult = {
+      ...r,
+      fields: applyVerticalStackMergeToFields(r.fields, pdfAbsPath, scale),
+    };
+    if (pdfWordAugmentEnabled({ fromTextFirst })) {
+      result = augmentTemplateFieldsFromPdfWordLayer(pdfAbsPath, scale, result);
+      result = {
+        ...result,
+        fields: applyVerticalStackMergeToFields(result.fields, pdfAbsPath, scale),
+      };
+    }
+    return result;
+  };
 
   const minFieldsRaw = process.env.TEXT_FIRST_MIN_FIELDS?.trim();
   const minFields = minFieldsRaw ? Math.max(3, Number(minFieldsRaw) || 6) : 6;
