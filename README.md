@@ -75,7 +75,10 @@ npm run dev:web
 ## Railway 배포 메모
 
 - DB: 프로젝트에 **PostgreSQL** 추가 → API 서비스 **Variables**에 `DATABASE_URL` = `${{Postgres.DATABASE_URL}}` (Reference 변수). 없으면 배포 시 `P1012 Environment variable not found: DATABASE_URL` 로 크래시.
-- 서비스 2개: **Settings → Root Directory** 를 각각 `apps/api`, `apps/web` 로 지정 (루트(`.`)로 두면 `No start command detected` 빌드 실패).
+- 서비스 3개: **Postgres** + **API** + **Web** (같은 GitHub repo, Root Directory만 다름).
+- **API** (`DongComDocs_Backend` 등): Root Directory = `apps/api` — `DATABASE_URL` 등 API 변수 필요.
+- **Web** (`DoncComDocs_Front` 등): Root Directory = `apps/web` — **DATABASE_URL 불필요**. 루트(`.`)로 두면 API `start:prod`가 실행되어 `DATABASE_URL is not set` 로 크래시함.
+- Web 빌드 시 Docker ARG: `VITE_API_URL=https://<api-공개-URL>`
 - 각 서비스는 `apps/*/railway.toml` 로 Dockerfile 빌드를 사용합니다.
 - API에 `JWT_SECRET`, `ADMIN_ID`, 프론트 도메인에 맞춘 `CORS_ORIGIN` 설정.
 - 웹 빌드 산출물은 정적 호스팅 또는 `vite preview`/Node 정적 서버로 서빙.
