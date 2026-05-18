@@ -4,6 +4,10 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 
+function pythonCmd(): string {
+  return process.env.PYTHON_BIN?.trim() || (process.platform === "win32" ? "python" : "python3");
+}
+
 export type SchemaSnapshot = Record<string, string[]>;
 
 export type LlmClassification = {
@@ -242,7 +246,7 @@ export function renderFirstPageToDataUri(pdfAbsPath: string, scale = 2): string 
       `pix=doc[0].get_pixmap(matrix=fitz.Matrix(${scale},${scale}))`,
       "pix.save(sys.argv[2])",
     ].join(";");
-    const out = spawnSync("python", ["-c", script, pdfAbsPath, tmpPng], {
+    const out = spawnSync(pythonCmd(), ["-c", script, pdfAbsPath, tmpPng], {
       encoding: "utf8",
       timeout: 60_000,
     });
@@ -292,7 +296,7 @@ export function extractFirstPageWordBboxesNormalized(
     "print(json.dumps(out, ensure_ascii=False))",
   ].join("\n");
 
-  const out = spawnSync("python", ["-c", script, pdfAbsPath, String(scale)], {
+  const out = spawnSync(pythonCmd(), ["-c", script, pdfAbsPath, String(scale)], {
     encoding: "utf8",
     timeout: 60_000,
     env: {
@@ -951,7 +955,7 @@ export function renderAllPagesToDataUris(
       "with open(sys.argv[3], 'w', encoding='utf-8') as f:",
       "    f.write(json.dumps(paths, ensure_ascii=False))",
     ].join("\n");
-    const out = spawnSync("python", [
+    const out = spawnSync(pythonCmd(), [
       "-c",
       script,
       pdfAbsPath,
@@ -1628,7 +1632,7 @@ export function extractPdfTextLabelCandidates(pdfAbsPath: string): string[] {
     "print(json.dumps(out[:max_out], ensure_ascii=False))",
   ].join("\n");
 
-  const out = spawnSync("python", ["-c", script, pdfAbsPath, String(maxPages), String(maxItems)], {
+  const out = spawnSync(pythonCmd(), ["-c", script, pdfAbsPath, String(maxPages), String(maxItems)], {
     encoding: "utf8",
     timeout: 90_000,
     env: {

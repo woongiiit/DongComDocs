@@ -13,6 +13,10 @@ RUN npm run build
 
 FROM node:20-alpine AS runner
 WORKDIR /app
+# PDF 렌더·bbox·텍스트 힌트: PyMuPDF(fitz) Python 스크립트 사용
+RUN apk add --no-cache python3 py3-pip \
+  && pip3 install --no-cache-dir pymupdf --break-system-packages \
+  && ln -sf /usr/bin/python3 /usr/bin/python
 ENV NODE_ENV=production
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
