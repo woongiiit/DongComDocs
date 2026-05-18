@@ -13,6 +13,7 @@ import type { AuthedRequest } from "../middleware/auth.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import {
   analyzeTemplateWithVllm,
+  getVllmTemplateRenderScale,
   buildTemplateFieldBoxes,
   classifyWithVllm,
   extractFieldsForDocTypeWithVllm,
@@ -481,8 +482,7 @@ router.post("/:id/layout-schemas/:docType/analyze-template", requireAuth, requir
   }
 
   try {
-    // 템플릿 분석은 입력 라벨(세부 셀 텍스트)을 더 정확히 읽기 위해 렌더링 스케일을 높입니다.
-    const scale = 3;
+    const scale = getVllmTemplateRenderScale();
     const vllmOpts = getVllmPdfRenderOptions();
     const imageDataUris = renderAllPagesToDataUris(abs, scale, vllmOpts.maxPages, {
       maxLongEdgePx: vllmOpts.maxLongEdgePx,

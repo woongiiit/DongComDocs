@@ -5,7 +5,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { getVllmPdfRenderOptions } from "./lib/reanalysis.js";
+import { getVllmPdfRenderOptions, getVllmTemplateRenderScale, isVllmTunnelBaseUrl } from "./lib/reanalysis.js";
 
 /** `npm run dev:api`를 모노레포 루트에서 실행해도 apps/api/.env가 항상 로드되도록 */
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -54,8 +54,12 @@ app.use("/api/admin", adminRoutes);
 app.listen(PORT, () => {
   const vllmPdf = getVllmPdfRenderOptions();
   console.log(`API listening on http://localhost:${PORT}`);
+  const vllmBase = (process.env.VLLM_BASE_URL ?? "http://localhost:8000").replace(/\/$/, "");
   console.info("[env] vllm pdf render", vllmPdf, {
     VLLM_RENDER_SCALE: process.env.VLLM_RENDER_SCALE ?? "(unset)",
     VLLM_MAX_PDF_PAGES: process.env.VLLM_MAX_PDF_PAGES ?? "(unset)",
+    VLLM_TEMPLATE_RENDER_SCALE: process.env.VLLM_TEMPLATE_RENDER_SCALE ?? getVllmTemplateRenderScale(),
+    VLLM_BASE_URL: vllmBase,
+    vllm_tunnel: isVllmTunnelBaseUrl(vllmBase),
   });
 });

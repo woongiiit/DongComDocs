@@ -905,6 +905,84 @@ export function getVllmMaxOutputTokens(): number {
   return Math.min(Math.max(64, v), VLLM_MAX_OUTPUT_TOKENS_CAP);
 }
 
+/** Cloudflare quick tunnel 등 프록시 뒤 vLLM URL 여부 */
+export function isVllmTunnelBaseUrl(baseUrl: string): boolean {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    return host.endsWith(".trycloudflare.com") || host.includes("ngrok");
+  } catch {
+    return false;
+  }
+}
+
+/** 템플릿 분석 VLM용 PDF 렌더 스케일(기본: VLLM_RENDER_SCALE, 상한 3). */
+export function getVllmTemplateRenderScale(): number {
+  const raw = process.env.VLLM_TEMPLATE_RENDER_SCALE?.trim();
+  if (raw !== undefined && raw !== "") {
+    const v = Number(raw);
+    if (Number.isFinite(v) && v >= 0.4) return Math.min(v, 4);
+  }
+  return Math.min(Math.max(getVllmPdfRenderOptions().scale, 1.2), 3);
+}
+
+function shouldSkipTemplateCoarseRetry(baseUrl: string): boolean {
+  const flag = process.env.VLLM_SKIP_COARSE_RETRY?.trim().toLowerCase();
+  if (flag === "1" || flag === "true" || flag === "yes") return true;
+  return isVllmTunnelBaseUrl(baseUrl);
+}
+
+function getVllmFetchTimeoutMs(baseUrl: string): number {
+  const raw = process.env.VLLM_FETCH_TIMEOUT_MS?.trim();
+  const n = raw ? Number(raw) : NaN;
+  if (Number.isFinite(n) && n >= 30_000) return Math.min(Math.floor(n), 900_000);
+  return isVllmTunnelBaseUrl(baseUrl) ? 120_000 : 600_000;
+}
+
+function formatVllmHttpError(status: number, txt: string, baseUrl: string): Error {
+  const isHtml = /^\s*<!DOCTYPE/i.test(txt) || /<html/i.test(txt);
+  if (status === 524 || (isHtml && status >= 500)) {
+    const tunnel = isVllmTunnelBaseUrl(baseUrl);
+    const hint =
+      "응답 대기 중 프록시(Cloudflare Tunnel 등)가 연결을 끊었습니다. " +
+      "VLLM_MAX_PDF_PAGES=1, VLLM_TEMPLATE_RENDER_SCALE=2, VLLM_SKIP_COARSE_RETRY=1 로 부하를 줄이거나, " +
+      "타임아웃이 긴 전용 터널/직접 연결을 사용하세요.";
+    return new Error(`vLLM 호출 실패 (${status}): ${tunnel || isHtml ? hint : txt.slice(0, 200)}`);
+  }
+  return new Error(`vLLM 호출 실패 (${status}): ${txt.slice(0, 300)}`);
+}
+
+type VllmChatCompletionJson = {
+  choices?: { message?: { content?: unknown }; finish_reason?: string }[];
+};
+
+async function vllmChatCompletions(baseUrl: string, body: object): Promise<VllmChatCompletionJson> {
+  const timeoutMs = getVllmFetchTimeoutMs(baseUrl);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw formatVllmHttpError(res.status, txt, baseUrl);
+    }
+    return (await res.json()) as VllmChatCompletionJson;
+  } catch (e) {
+    if (e instanceof Error && e.name === "AbortError") {
+      throw new Error(
+        `vLLM 호출 시간 초과 (${Math.round(timeoutMs / 1000)}초). VLLM_MAX_PDF_PAGES·렌더 스케일을 낮추거나 VLLM_FETCH_TIMEOUT_MS를 늘리세요.`
+      );
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export type RenderAllPagesExtra = Pick<VllmPdfRenderOptions, "maxLongEdgePx" | "imageFormat" | "jpegQuality">;
 
 /** PDF를 data URI 배열로 렌더. maxPages·긴 변 상한·JPEG로 vLLM 입력을 줄인다. */
@@ -1449,18 +1527,7 @@ export async function classifyWithVllm(
       },
     ],
   };
-  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`vLLM 호출 실패 (${res.status}): ${txt.slice(0, 300)}`);
-  }
-  const data = (await res.json()) as {
-    choices?: { message?: { content?: unknown }; finish_reason?: string }[];
-  };
+  const data = await vllmChatCompletions(baseUrl, body);
   const responseText = chatCompletionContentToString(data.choices?.[0]?.message?.content);
   const parsed = tryParseJsonContent(responseText) ?? {};
   const docTypeRaw = String(parsed.docType ?? "UNKNOWN").trim();
@@ -1555,17 +1622,7 @@ export async function extractFieldsForDocTypeWithVllm(
     ],
   };
 
-  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`vLLM 호출 실패 (${res.status}): ${txt.slice(0, 300)}`);
-  }
-
-  const data = (await res.json()) as { choices?: { message?: { content?: unknown } }[] };
+  const data = await vllmChatCompletions(baseUrl, body);
   const responseText = chatCompletionContentToString(data.choices?.[0]?.message?.content);
   const parsed = tryParseJsonContent(responseText) ?? {};
   const root = parsed.extractedFields && typeof parsed.extractedFields === "object" ? parsed.extractedFields : parsed;
@@ -1728,18 +1785,7 @@ export async function analyzeTemplateWithVllm(
       ],
     };
 
-    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(`vLLM 호출 실패 (${res.status}): ${txt.slice(0, 300)}`);
-    }
-    const data = (await res.json()) as {
-      choices?: { message?: { content?: unknown }; finish_reason?: string }[];
-    };
+    const data = await vllmChatCompletions(baseUrl, body);
     const choice0 = data.choices?.[0];
     const responseText = chatCompletionContentToString(choice0?.message?.content);
     const parsed = tryParseJsonContent(responseText) ?? {};
@@ -1837,6 +1883,11 @@ export async function analyzeTemplateWithVllm(
     augmentTemplateFieldsFromPdfWordLayer(pdfAbsPath, TEMPLATE_ANALYZE_PDF_WORD_SCALE, r);
 
   if (!isCoarse) return finish(initial);
+
+  if (shouldSkipTemplateCoarseRetry(baseUrl)) {
+    console.info("[template-analyze] skip coarse retry (tunnel or VLLM_SKIP_COARSE_RETRY)");
+    return finish(initial);
+  }
 
   // 이전 재시도는 initial 필드 전부를 forbidden 처리해 모델이 fields: []만 내는 경우가 많았음(특히 필드 수 < 8일 때).
   const retry = await runOnce(
