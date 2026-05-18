@@ -124,8 +124,10 @@ export function collapseOverlappingFieldKeys(fields: string[]): string[] {
 
 export function normalizeSchemaFieldKeys(
   input: string[],
-  context: string
+  context: string,
+  opts?: { strict?: boolean }
 ): { fields: string[]; log: FieldKeyPostprocessLog[] } {
+  const strict = opts?.strict !== false;
   const log: FieldKeyPostprocessLog[] = [];
   const seen = new Set<string>();
   const out: string[] = [];
@@ -158,7 +160,7 @@ export function normalizeSchemaFieldKeys(
     } else if (isTitleOrHeaderNoiseField(candidate)) {
       log.push({ raw: base, reason: "title_header_noise_reject" });
       continue;
-    } else if (fieldKeyStrictEnabled() && !isLikelyInputFieldLabel(candidate)) {
+    } else if (strict && fieldKeyStrictEnabled() && !isLikelyInputFieldLabel(candidate)) {
       log.push({ raw: base, reason: "unlikely_input_label_reject" });
       continue;
     }
@@ -581,6 +583,39 @@ function remapFieldKeyByWords(key: string, wordNormSet: Set<string>): string {
 function fieldKeyStrictEnabled(): boolean {
   const v = process.env.VLLM_FIELD_KEY_STRICT?.trim().toLowerCase();
   return v !== "0" && v !== "false" && v !== "no" && v !== "off";
+}
+
+/** text_first용 PDF 본문이 실제 양식 라벨을 담고 있는지(스캔 PDF·메타만 있는 경우 제외) */
+function pdfPlainTextUsableForFields(plain: string): boolean {
+  const t = plain.replace(/\s+/g, "");
+  if (t.length < 80) return false;
+  const hangul = (t.match(/[\uac00-\ud7a3]/g) || []).length;
+  if (hangul < 24) return false;
+  const labelHints =
+    /(성명|학번|학과|전공|이메일|e-?mail|전화|핸드폰|생년|소속|지원|gpa|평점|학점)/i.test(t);
+  return labelHints;
+}
+
+/** 템플릿 필드 정규화: strict로 전부 걸러지면 한 번 완화해 재시도 */
+function normalizeTemplateSchemaFields(
+  input: string[],
+  context: string
+): { fields: string[]; log: FieldKeyPostprocessLog[] } {
+  const first = normalizeSchemaFieldKeys(input, context, { strict: true });
+  if (first.fields.length > 0 || input.length === 0 || !fieldKeyStrictEnabled()) {
+    return first;
+  }
+  const relaxed = normalizeSchemaFieldKeys(input, `${context}Relaxed`, { strict: false });
+  if (relaxed.fields.length > 0) {
+    console.warn("[template-analyze] field strict rejected all; using relaxed keys", {
+      context,
+      inCount: input.length,
+      kept: relaxed.fields.length,
+      sample: relaxed.fields.slice(0, 12),
+    });
+    return relaxed;
+  }
+  return first;
 }
 
 /** 표·입력란 옆 짧은 라벨로 보이는지 (범용 정형문서) */
@@ -1284,13 +1319,30 @@ function normalizeParsedJsonRoot(parsed: unknown): Record<string, unknown> | nul
 
 /** 템플릿 분석 JSON에서 필드 목록 후보 추출(fields가 객체/다른 키명인 경우 포함) */
 function extractRawFieldsArrayFromParsed(parsed: Record<string, unknown>): unknown[] {
-  const keys = ["fields", "field_list", "fieldList", "labels", "keys", "field_names", "fieldNames"];
+  const keys = [
+    "fields",
+    "field_list",
+    "fieldList",
+    "labels",
+    "keys",
+    "field_names",
+    "fieldNames",
+    "form_fields",
+    "formFields",
+    "items",
+  ];
   for (const k of keys) {
     const v = parsed[k];
     if (Array.isArray(v)) return v;
     if (v && typeof v === "object" && !Array.isArray(v)) {
       return Object.keys(v as Record<string, unknown>);
     }
+  }
+  for (const nest of ["data", "result", "output"]) {
+    const inner = parsed[nest];
+    if (!inner || typeof inner !== "object" || Array.isArray(inner)) continue;
+    const nested = extractRawFieldsArrayFromParsed(inner as Record<string, unknown>);
+    if (nested.length) return nested;
   }
   return [];
 }
@@ -1994,13 +2046,39 @@ export function extractPdfPagePlainText(pdfAbsPath: string): string {
     timeout: 90_000,
     env: { ...process.env, PYTHONIOENCODING: "utf-8" },
   });
-  if (out.status !== 0) return "";
+  if (out.status !== 0) {
+    console.warn("[pdf-plain-text] 추출 실패", {
+      status: out.status,
+      stderr: (out.stderr || "").slice(0, 400),
+    });
+    return "";
+  }
   try {
     const parsed = JSON.parse((out.stdout || "").trim() || "{}") as { text?: string };
     return String(parsed.text ?? "").trim();
   } catch {
     return "";
   }
+}
+
+/** VLM·text_first 모두 실패 시 PDF 텍스트 레이어 라벨 후보로 필드 목록 구성 */
+function bootstrapTemplateFieldsFromPdfLabels(pdfAbsPath: string): TemplateAnalysisResult | null {
+  const candidates = extractPdfTextLabelCandidates(pdfAbsPath);
+  const raw: string[] = [];
+  for (const c of candidates) {
+    if (!isLikelyAugmentTableLabel(c)) continue;
+    const key = sanitizeFieldKeyCandidate(c.replace(/\s+/g, ""));
+    if (key) raw.push(key);
+  }
+  const unique = [...new Set(raw)];
+  if (unique.length < 4) return null;
+  const { fields } = normalizeTemplateSchemaFields(unique, "pdfLabelBootstrap");
+  if (fields.length < 4) return null;
+  console.info("[template-analyze] pdf label bootstrap", {
+    fieldCount: fields.length,
+    sample: fields.slice(0, 16),
+  });
+  return { fields, summary: "PDF 텍스트 레이어 라벨 기반 추출", fieldBboxes: [] };
 }
 
 const TEMPLATE_TEXT_FIRST_SCHEMA = [
@@ -2060,7 +2138,7 @@ function templateResultFromFieldsParsed(
     String(parsed.summary ?? "").trim() ||
     String(parsed.document_type ?? "").trim() ||
     "텍스트 기반 필드 추출";
-  const { fields: normFields } = normalizeSchemaFieldKeys(fields, context);
+  const { fields: normFields } = normalizeTemplateSchemaFields(fields, context);
   return { fields: normFields, summary, fieldBboxes: [] };
 }
 
@@ -2135,6 +2213,13 @@ export async function analyzeTemplateWithVllm(
       console.warn("[template-analyze] text_first: PDF 텍스트 부족", { len: plain.length });
       return null;
     }
+    if (!pdfPlainTextUsableForFields(plain)) {
+      console.warn("[template-analyze] text_first: PDF 본문 품질 부족(스캔 PDF 가능)", {
+        len: plain.length,
+        hangul: (plain.match(/[\uac00-\ud7a3]/g) || []).length,
+      });
+      return null;
+    }
     const userText = [
       docTypeHint,
       "",
@@ -2152,11 +2237,14 @@ export async function analyzeTemplateWithVllm(
     ].join("\n");
     const maxTok = Math.min(4096, getVllmTemplateMaxOutputTokens(baseUrl));
     const parsed = await callLlm(userText, maxTok, false);
+    const rawItems = extractRawFieldsArrayFromParsed(parsed);
     const result = templateResultFromFieldsParsed(parsed, "textFirst");
     if (result.fields.length < minFields) {
       console.warn("[template-analyze] text_first: 필드 수 부족", {
         got: result.fields.length,
+        rawItems: rawItems.length,
         need: minFields,
+        parsedKeys: Object.keys(parsed).slice(0, 12),
       });
       return null;
     }
@@ -2185,13 +2273,20 @@ export async function analyzeTemplateWithVllm(
       "layout_hierarchy·bbox는 출력하지 않는다.",
     ].join("\n");
 
+    const imageCount = (await ensureImages()).length;
+    if (imageCount < 1) {
+      throw new Error(
+        "템플릿 PDF를 이미지로 변환하지 못했습니다. Railway API에 Python·PyMuPDF가 설치돼 있는지 확인하세요."
+      );
+    }
+
     const parsed = await callLlm(userText, getVllmTemplateMaxOutputTokens(baseUrl), true);
     let result = templateResultFromFieldsParsed(parsed, "visionSimple");
 
     if (result.fields.length < minFields) {
       const legacy = templateResultFromLayoutHierarchy(parsed);
       if (legacy && legacy.fields.length > result.fields.length) {
-        const { fields } = normalizeSchemaFieldKeys(legacy.fields, "visionHierarchyFallback");
+        const { fields } = normalizeTemplateSchemaFields(legacy.fields, "visionHierarchyFallback");
         result = { fields, summary: legacy.summary, fieldBboxes: legacy.fieldBboxes ?? [] };
       }
     }
@@ -2199,6 +2294,7 @@ export async function analyzeTemplateWithVllm(
     console.info("[template-analyze] vision simple", {
       docType,
       fieldCount: result.fields.length,
+      imageCount,
       mode,
     });
     return result;
@@ -2216,6 +2312,11 @@ export async function analyzeTemplateWithVllm(
     }
   }
 
-  return finish(await runVisionSimple());
+  let visionResult = await runVisionSimple();
+  if (visionResult.fields.length === 0 && pdfAbsPath) {
+    const boot = bootstrapTemplateFieldsFromPdfLabels(pdfAbsPath);
+    if (boot) visionResult = boot;
+  }
+  return finish(visionResult, false);
 }
 

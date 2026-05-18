@@ -485,14 +485,11 @@ router.post("/:id/layout-schemas/:docType/analyze-template", requireAuth, requir
   try {
     const vllmOpts = getVllmTemplatePdfRenderOptions();
     const templateMode = getTemplateAnalysisMode();
-    let imageDataUris: string[] = [];
-    if (templateMode !== "text_first") {
-      imageDataUris = renderAllPagesToDataUris(abs, vllmOpts.scale, vllmOpts.maxPages, {
-        maxLongEdgePx: vllmOpts.maxLongEdgePx,
-        imageFormat: vllmOpts.imageFormat,
-        jpegQuality: vllmOpts.jpegQuality,
-      });
-    }
+    const imageDataUris = renderAllPagesToDataUris(abs, vllmOpts.scale, vllmOpts.maxPages, {
+      maxLongEdgePx: vllmOpts.maxLongEdgePx,
+      imageFormat: vllmOpts.imageFormat,
+      jpegQuality: vllmOpts.jpegQuality,
+    });
     console.info("[analyze-template]", { templateMode, vllmOpts, imagePages: imageDataUris.length });
     const analyzed = await analyzeTemplateWithVllm(imageDataUris, docType, abs);
 
