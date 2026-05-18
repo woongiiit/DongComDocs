@@ -116,6 +116,9 @@ export function normalizeSchemaFieldKeys(
     } else if (isProbableSentenceFieldKey(candidate)) {
       log.push({ raw: base, reason: "sentence_like_reject" });
       continue;
+    } else if (shouldSkipFieldBboxPreview(candidate)) {
+      log.push({ raw: base, reason: "non_input_label_reject" });
+      continue;
     }
 
     let key = finalKey;
@@ -479,9 +482,12 @@ export function matchFieldKeysToWordBboxesWithUsed(
       const nw = normalizeLabelForMatch(w.text);
       if (!nw) return false;
       if (longTail) return nw === nk;
-      if (nw === nk || nw.includes(nk)) return true;
-      if (nk.includes(nw)) {
+      if (nw === nk) return true;
+      if (nw.length >= 2 && nk.length >= 2 && (nw.includes(nk) || nk.includes(nw))) {
         if (nk.length >= 2 && nw.length === 1) return false;
+        const shorter = Math.min(nw.length, nk.length);
+        const longer = Math.max(nw.length, nk.length);
+        if (shorter < 3 && longer / shorter > 2.5) return false;
         return true;
       }
       return false;
@@ -580,8 +586,22 @@ function remapFieldKeyByWords(key: string, wordNormSet: Set<string>): string {
   return key;
 }
 
-/** `apps/api` 템플릿 분석 라우트의 단어 레이어 scale과 맞춘다. */
-const TEMPLATE_ANALYZE_PDF_WORD_SCALE = 3;
+/** VLM이 반환한 0~1 bbox가 입력란 라벨보다 큰 빈 칸·본문 블록인지 */
+function isOversizedTemplateVlmBBox(w: number, h: number): boolean {
+  const area = w * h;
+  return area > 0.04 || h > 0.1 || w > 0.55;
+}
+
+/** 미리보기 bbox를 그리지 않을 필드 키(첨부 안내·서명·귀하 등) */
+function shouldSkipFieldBboxPreview(key: string): boolean {
+  const tail = fieldKeyTailForMatch(key).replace(/\s+/g, "");
+  if (!tail || tail.length < 2) return true;
+  if (/^\d+부$/.test(tail)) return true;
+  if (/(귀하|서명|지원자|발급분|발급본|별지|서약|추천서|학과장|대학원장|이하생략|필요시)/.test(tail)) return true;
+  if (/^(첨부|학업계획|연구계획)$/.test(tail)) return true;
+  if (tail.includes("동국대학교") && tail.includes("귀하")) return true;
+  return false;
+}
 
 /**
  * PDF 단어 보강 시 필드 그룹 키.
@@ -606,9 +626,11 @@ function isLikelyAugmentTableLabel(text: string): boolean {
   if (s.length < 2 || s.length > 40) return false;
   if (/^[\d.\s\-–—/]+$/.test(s)) return false;
   if (/^\d+\.$/.test(s)) return false;
+  if (/^\d+부$/.test(s)) return false;
+  if (/(귀하|서명|지원자|발급|이후|필요시|※|별지|학과장|추천|서약|첨부|본인은)/.test(s)) return false;
   const n = normalizeLabelForMatch(s);
   if (n.length < 2) return false;
-  if (["인적사항", "지도교수", "연구계획", "연구계획서"].includes(n)) return false;
+  if (["인적사항", "지도교수", "연구계획", "연구계획서", "학업계획"].includes(n)) return false;
   return true;
 }
 
@@ -691,6 +713,7 @@ export function augmentTemplateFieldsFromPdfWordLayer(
     for (let wi = 0; wi < words.length; wi++) {
       if (usedWordIndices.has(wi)) continue;
       const w = words[wi]!;
+      if (w.y > 0.68) continue;
       if (!isLikelyAugmentTableLabel(w.text)) continue;
       const cy = w.y + w.h / 2;
       if (cy < ymin || cy > ymax) continue;
@@ -754,6 +777,18 @@ export function buildTemplateFieldBoxes(
   const matchedByKey = new Map(matched.map((m) => [m.key, m]));
 
   const fieldBoxes: FieldBox[] = normalizedFields.map((key) => {
+    if (shouldSkipFieldBboxPreview(key)) {
+      return {
+        key,
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+        matchCount: 0,
+        bboxSource: "none" as const,
+        matchedWord: null,
+      };
+    }
     const m = matchedByKey.get(key);
     if (m && m.matchCount > 0) {
       // 매칭이 되더라도 점/숫자 조각처럼 너무 작은 bbox는 입력칸이 아닐 가능성이 커서
@@ -788,7 +823,7 @@ export function buildTemplateFieldBoxes(
         };
       }
       const san = sanitizeTemplateBBoxNorm(v.x, v.y, v.w, v.h);
-      if (!san) {
+      if (!san || isOversizedTemplateVlmBBox(san.w, san.h)) {
         return {
           key,
           x: 0,
@@ -796,7 +831,7 @@ export function buildTemplateFieldBoxes(
           w: 0,
           h: 0,
           matchCount: 0,
-          bboxSource: "vlm" as const,
+          bboxSource: "none" as const,
           matchedWord: null,
           page: v.page ?? 1,
         };
@@ -1386,7 +1421,9 @@ function templateResultFromLayoutHierarchy(parsed: Record<string, unknown>): Tem
     const raw = bboxXminYminXmaxYmaxToNorm(bbox);
     const bb = raw ? sanitizeTemplateBBoxNorm(raw.x, raw.y, raw.w, raw.h) : null;
     const pg = parseNodePageOptional(node);
-    if (bb) fieldBboxes.push({ key, ...bb, ...(pg !== undefined ? { page: pg } : {}) });
+    if (bb && !isOversizedTemplateVlmBBox(bb.w, bb.h)) {
+      fieldBboxes.push({ key, ...bb, ...(pg !== undefined ? { page: pg } : {}) });
+    }
   }
 
   function walk(nodes: unknown[], sectionLabel: string, depth: number): void {
@@ -1933,7 +1970,7 @@ export async function analyzeTemplateWithVllm(
     initial.fields.length < 8 || initial.fields.some(isBareSectionHeaderField);
 
   const finish = (r: TemplateAnalysisResult) =>
-    augmentTemplateFieldsFromPdfWordLayer(pdfAbsPath, TEMPLATE_ANALYZE_PDF_WORD_SCALE, r);
+    augmentTemplateFieldsFromPdfWordLayer(pdfAbsPath, getVllmTemplateRenderScale(), r);
 
   if (!isCoarse) return finish(initial);
 
