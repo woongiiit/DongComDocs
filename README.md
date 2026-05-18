@@ -74,7 +74,7 @@ npm run dev:web
 
 ## Railway 배포 메모
 
-- DB: Railway PostgreSQL 플러그인 연결 후 `DATABASE_URL` 설정.
+- DB: 프로젝트에 **PostgreSQL** 추가 → API 서비스 **Variables**에 `DATABASE_URL` = `${{Postgres.DATABASE_URL}}` (Reference 변수). 없으면 배포 시 `P1012 Environment variable not found: DATABASE_URL` 로 크래시.
 - 서비스 2개: **Settings → Root Directory** 를 각각 `apps/api`, `apps/web` 로 지정 (루트(`.`)로 두면 `No start command detected` 빌드 실패).
 - 각 서비스는 `apps/*/railway.toml` 로 Dockerfile 빌드를 사용합니다.
 - API에 `JWT_SECRET`, `ADMIN_ID`, 프론트 도메인에 맞춘 `CORS_ORIGIN` 설정.

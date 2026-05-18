@@ -10,7 +10,7 @@
     "dev:web": "npm run dev --workspace=apps/web",
     "dev:api": "npm run dev --workspace=apps/api",
     "build": "npm run build --workspace=@dongcomdocs/api",
-    "start": "npm run db:push --workspace=@dongcomdocs/api && npm run start --workspace=@dongcomdocs/api",
+    "start": "npm run start:prod --workspace=@dongcomdocs/api",
     "build:all": "npm run build --workspace=apps/api && npm run build --workspace=apps/web",
     "db:push": "npm run db:push --workspace=apps/api",
     "db:studio": "npm run db:studio --workspace=apps/api"
