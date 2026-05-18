@@ -10,6 +10,11 @@ import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = Router();
 
+function routeParamId(v: string | string[] | undefined): string | undefined {
+  if (v == null) return undefined;
+  return Array.isArray(v) ? v[0] : v;
+}
+
 const ANNOUNCEMENT_UPLOAD_ROOT = path.join(process.cwd(), "uploads", "announcements");
 
 function ensureAnnouncementUploadDir() {
@@ -77,7 +82,11 @@ router.post("/", requireAuth, requireAdmin, async (req: AuthedRequest, res) => {
 });
 
 router.patch("/:id", requireAuth, requireAdmin, async (req: AuthedRequest, res) => {
-  const id = req.params.id;
+  const id = routeParamId(req.params.id);
+  if (!id) {
+    res.status(400).json({ error: "잘못된 요청입니다." });
+    return;
+  }
   const existing = await prisma.announcement.findUnique({ where: { id } });
   if (!existing) {
     res.status(404).json({ error: "공지사항을 찾을 수 없습니다." });
@@ -120,7 +129,11 @@ router.post(
 );
 
 router.delete("/:id", requireAuth, requireAdmin, async (req: AuthedRequest, res) => {
-  const id = req.params.id;
+  const id = routeParamId(req.params.id);
+  if (!id) {
+    res.status(400).json({ error: "잘못된 요청입니다." });
+    return;
+  }
   const existing = await prisma.announcement.findUnique({ where: { id } });
   if (!existing) {
     res.status(404).json({ error: "공지사항을 찾을 수 없습니다." });
