@@ -14,6 +14,7 @@ import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import {
   analyzeTemplateWithVllm,
   getVllmTemplatePdfRenderOptions,
+  getTemplateAnalysisMode,
   buildTemplateFieldBoxes,
   classifyWithVllm,
   extractFieldsForDocTypeWithVllm,
@@ -483,14 +484,16 @@ router.post("/:id/layout-schemas/:docType/analyze-template", requireAuth, requir
 
   try {
     const vllmOpts = getVllmTemplatePdfRenderOptions();
-    if (process.env.VLLM_BASE_URL) {
-      console.info("[analyze-template] vllm render", vllmOpts);
+    const templateMode = getTemplateAnalysisMode();
+    let imageDataUris: string[] = [];
+    if (templateMode !== "text_first") {
+      imageDataUris = renderAllPagesToDataUris(abs, vllmOpts.scale, vllmOpts.maxPages, {
+        maxLongEdgePx: vllmOpts.maxLongEdgePx,
+        imageFormat: vllmOpts.imageFormat,
+        jpegQuality: vllmOpts.jpegQuality,
+      });
     }
-    const imageDataUris = renderAllPagesToDataUris(abs, vllmOpts.scale, vllmOpts.maxPages, {
-      maxLongEdgePx: vllmOpts.maxLongEdgePx,
-      imageFormat: vllmOpts.imageFormat,
-      jpegQuality: vllmOpts.jpegQuality,
-    });
+    console.info("[analyze-template]", { templateMode, vllmOpts, imagePages: imageDataUris.length });
     const analyzed = await analyzeTemplateWithVllm(imageDataUris, docType, abs);
 
     // 템플릿 단계 bbox 미리보기(1페이지)용 데이터 생성

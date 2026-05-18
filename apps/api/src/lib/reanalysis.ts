@@ -120,6 +120,9 @@ export function normalizeSchemaFieldKeys(
     } else if (shouldSkipFieldBboxPreview(candidate)) {
       log.push({ raw: base, reason: "non_input_label_reject" });
       continue;
+    } else if (isTitleOrHeaderNoiseField(candidate)) {
+      log.push({ raw: base, reason: "title_header_noise_reject" });
+      continue;
     } else if (fieldKeyStrictEnabled() && !isLikelyInputFieldLabel(candidate)) {
       log.push({ raw: base, reason: "unlikely_input_label_reject" });
       continue;
@@ -1038,12 +1041,31 @@ function shouldSkipTemplateCoarseRetry(baseUrl: string): boolean {
   return isVllmTunnelBaseUrl(baseUrl);
 }
 
-/** 1단계 섹션 구조 → 2단계 leaf 추출 (터널·단일 패스 설정 시 비활성) */
-function shouldUseTemplateTwoStage(baseUrl: string): boolean {
+/** 1단계 섹션 구조 → 2단계 leaf (기본 off, VLLM_TEMPLATE_TWO_STAGE=1 일 때만) */
+function shouldUseTemplateTwoStage(_baseUrl: string): boolean {
   const flag = process.env.VLLM_TEMPLATE_TWO_STAGE?.trim().toLowerCase();
-  if (flag === "0" || flag === "false" || flag === "no" || flag === "off") return false;
-  if (flag === "1" || flag === "true" || flag === "yes" || flag === "on") return true;
-  return !isVllmTunnelBaseUrl(baseUrl);
+  return flag === "1" || flag === "true" || flag === "yes" || flag === "on";
+}
+
+/** 템플릿 분석: text_first(PDF텍스트+LLM) | vision(이미지) | auto */
+export type TemplateAnalysisMode = "text_first" | "vision" | "auto";
+
+export function getTemplateAnalysisMode(): TemplateAnalysisMode {
+  const raw = process.env.VLLM_TEMPLATE_MODE?.trim().toLowerCase();
+  if (raw === "vision" || raw === "vlm" || raw === "image") return "vision";
+  if (raw === "auto") return "auto";
+  return "text_first";
+}
+
+/** 문서 제목·양식명이 필드로 잘못 들어온 `섹션_*` 조각 */
+function isTitleOrHeaderNoiseField(key: string): boolean {
+  const k = key.replace(/\s+/g, "");
+  const tail = fieldKeyTailForMatch(key).replace(/\s+/g, "");
+  if (/^섹션_지원구분(_\d+)?$/.test(k)) return true;
+  if (/^섹션_(학|석|박)/.test(k) && /(연계|통합|지원서|과정|프로그램)/.test(k)) return true;
+  if (tail.length > 12 && /(연계과정|통합연계|지원서|양식\d)/.test(tail)) return true;
+  if (/^(학|석|박).*(연계|통합).*(지원서|과정)/.test(tail) && tail.length > 10) return true;
+  return false;
 }
 
 function getVllmFetchTimeoutMs(baseUrl: string): number {
@@ -1944,6 +1966,74 @@ export function extractPdfTextLabelCandidates(pdfAbsPath: string): string[] {
   }
 }
 
+/** PDF 텍스트 레이어를 읽기 순서로 이어 붙임 (text_first 모드용) */
+export function extractPdfPagePlainText(pdfAbsPath: string): string {
+  if (!pdfAbsPath || !fs.existsSync(pdfAbsPath)) return "";
+  const maxPagesRaw = process.env.PDF_TEXT_LAYER_MAX_PAGES;
+  const maxCharsRaw = process.env.PDF_TEXT_FIRST_MAX_CHARS;
+  let maxPages = maxPagesRaw == null || maxPagesRaw === "" ? 4 : Number(maxPagesRaw);
+  let maxChars = maxCharsRaw == null || maxCharsRaw === "" ? 14_000 : Number(maxCharsRaw);
+  if (!Number.isFinite(maxPages) || maxPages < 1) maxPages = 4;
+  if (maxPages > 20) maxPages = 20;
+  if (!Number.isFinite(maxChars) || maxChars < 2000) maxChars = 14_000;
+  if (maxChars > 40_000) maxChars = 40_000;
+
+  const script = [
+    "import fitz,sys,json",
+    "doc=fitz.open(sys.argv[1])",
+    "max_pages=int(sys.argv[2])",
+    "max_chars=int(sys.argv[3])",
+    "parts=[]",
+    "for pi in range(min(len(doc), max_pages)):",
+    "    page=doc[pi]",
+    "    blocks=page.get_text('blocks') or []",
+    "    blocks.sort(key=lambda b:(round(b[1],1), round(b[0],1)))",
+    "    for b in blocks:",
+    "        t=(b[4] or '').strip()",
+    "        if t: parts.append(t)",
+    "text='\\n'.join(parts)",
+    "print(json.dumps({'text': text[:max_chars]}, ensure_ascii=False))",
+  ].join("\n");
+
+  const out = spawnSync(pythonCmd(), ["-c", script, pdfAbsPath, String(maxPages), String(maxChars)], {
+    encoding: "utf8",
+    timeout: 90_000,
+    env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+  });
+  if (out.status !== 0) return "";
+  try {
+    const parsed = JSON.parse((out.stdout || "").trim() || "{}") as { text?: string };
+    return String(parsed.text ?? "").trim();
+  } catch {
+    return "";
+  }
+}
+
+const TEMPLATE_TEXT_FIRST_SCHEMA = [
+  "# 출력 (JSON만)",
+  "- document_type: 문자열 (문서 종류)",
+  "- summary: 문자열 (한 줄 요약, 선택)",
+  "- fields: 문자열 배열 — **입력란 옆 짧은 라벨만** (예: 성명, 학번, 지원학과, E-mail)",
+  "",
+  "# 규칙",
+  "- fields는 표·입력란의 **항목명**만. 문서 제목·양식 이름·법적 고지·첨부 안내·서명·귀하 문구는 넣지 않는다.",
+  "- `섹션_` 접두사를 붙이지 않는다. 같은 라벨이 여러 구역에 있을 때만 `구역명_라벨` 형태(예: 지원구분_성명).",
+  "- 괄호 안 부연·※·'해당시에만'·'1부'·'발급본'은 제외한다.",
+  "- layout_hierarchy·bbox는 출력하지 않는다.",
+].join("\n");
+
+const TEMPLATE_SIMPLE_VISION_SCHEMA = [
+  "# 출력 (JSON만)",
+  "- document_type: 문자열",
+  "- summary: 문자열 (선택)",
+  "- fields: 문자열 배열 — 입력란·표의 짧은 항목 라벨만",
+  "",
+  "# 규칙",
+  "- layout_hierarchy·bbox·children은 **출력하지 않는다**.",
+  "- 문서 제목 전체, 양식 번호 문구, 첨부 목록 문장, 서명·귀하는 fields에 넣지 않는다.",
+  "- `섹션_` 접두사 금지. 필요 시에만 `표이름_라벨`로 구분.",
+].join("\n");
+
 function buildPdfTextHintsBlock(candidates: string[]): string {
   if (!candidates.length) return "";
   const lines = candidates.map((t) => t.replace(/\s+/g, " ").trim().slice(0, 80)).filter(Boolean);
@@ -1958,6 +2048,20 @@ function buildPdfTextHintsBlock(candidates: string[]): string {
   ].join("\n");
 }
 
+function templateResultFromFieldsParsed(
+  parsed: Record<string, unknown>,
+  context: string
+): TemplateAnalysisResult {
+  const rawFieldItems = extractRawFieldsArrayFromParsed(parsed);
+  let fields = rawFieldItems.map(normalizeFieldListItem).filter((s): s is string => Boolean(s));
+  const summary =
+    String(parsed.summary ?? "").trim() ||
+    String(parsed.document_type ?? "").trim() ||
+    "텍스트 기반 필드 추출";
+  const { fields: normFields } = normalizeSchemaFieldKeys(fields, context);
+  return { fields: normFields, summary, fieldBboxes: [] };
+}
+
 export async function analyzeTemplateWithVllm(
   imageDataUris: string[],
   docType: string,
@@ -1970,21 +2074,37 @@ export async function analyzeTemplateWithVllm(
     : await fetch(`${baseUrl}/v1/models`).then((r) => r.json()).then((j) => j.data?.[0]?.id as string);
   if (!modelId) throw new Error("vLLM 모델을 찾을 수 없습니다.");
 
-  const textHints =
-    pdfAbsPath && pdfTextHintsEnabled() ? extractPdfTextLabelCandidates(pdfAbsPath) : [];
-  if (textHints.length) {
-    console.info("[pdf-text-hints] injected", { docType, count: textHints.length, sample: textHints.slice(0, 24) });
+  const mode = getTemplateAnalysisMode();
+  const docTypeHint = buildTemplateDocTypeHint(docType);
+  const finish = (r: TemplateAnalysisResult) =>
+    augmentTemplateFieldsFromPdfWordLayer(pdfAbsPath, getVllmTemplateRenderScale(), r);
+
+  const minFieldsRaw = process.env.TEXT_FIRST_MIN_FIELDS?.trim();
+  const minFields = minFieldsRaw ? Math.max(3, Number(minFieldsRaw) || 6) : 6;
+  let resolvedImages = [...imageDataUris];
+
+  async function ensureImages(): Promise<string[]> {
+    if (resolvedImages.length) return resolvedImages;
+    if (!pdfAbsPath) return [];
+    const opts = getVllmTemplatePdfRenderOptions();
+    resolvedImages = renderAllPagesToDataUris(pdfAbsPath, opts.scale, opts.maxPages, {
+      maxLongEdgePx: opts.maxLongEdgePx,
+      imageFormat: opts.imageFormat,
+      jpegQuality: opts.jpegQuality,
+    });
+    return resolvedImages;
   }
 
-  const hintsBlock = buildPdfTextHintsBlock(textHints);
-  const docTypeHint = buildTemplateDocTypeHint(docType);
-  const twoStage = shouldUseTemplateTwoStage(baseUrl);
-
-  async function callVlm(userText: string, maxTokens: number): Promise<Record<string, unknown>> {
-    const promptContent = [
+  async function callLlm(userText: string, maxTokens: number, withImages: boolean): Promise<Record<string, unknown>> {
+    const userContent: { type: string; text?: string; image_url?: { url: string } }[] = [
       { type: "text", text: userText },
-      ...imageDataUris.map((url) => ({ type: "image_url", image_url: { url } })),
     ];
+    if (withImages) {
+      const urls = await ensureImages();
+      for (const url of urls) {
+        userContent.push({ type: "image_url", image_url: { url } });
+      }
+    }
     const body = {
       model: modelId,
       temperature: 0.01,
@@ -1993,11 +2113,10 @@ export async function analyzeTemplateWithVllm(
         {
           role: "system",
           content:
-            "너는 정형 문서 이미지 레이아웃 분석기다. 사용자 메시지의 JSON 스키마와 규칙을 따른다. " +
-            "JSON 이외의 문장·마크다운·주석을 출력하지 마라. " +
-            "필드로 쓸 라벨은 짧게 유지하고, 안내·법적 문장 전체를 한 키에 넣지 마라.",
+            "너는 정형 문서(지원서·신청서)에서 입력 항목 필드명만 추출한다. " +
+            "반드시 JSON만 출력한다. 설명·마크다운·주석 금지.",
         },
-        { role: "user", content: promptContent },
+        { role: "user", content: userContent },
       ],
     };
     const data = await vllmChatCompletions(baseUrl, body);
@@ -2005,172 +2124,92 @@ export async function analyzeTemplateWithVllm(
     return tryParseJsonContent(responseText) ?? {};
   }
 
-  async function runSectionsPhase(): Promise<string[]> {
+  async function runTextFirst(): Promise<TemplateAnalysisResult | null> {
+    if (!pdfAbsPath) return null;
+    const plain = extractPdfPagePlainText(pdfAbsPath);
+    if (plain.length < 80) {
+      console.warn("[template-analyze] text_first: PDF 텍스트 부족", { len: plain.length });
+      return null;
+    }
     const userText = [
       docTypeHint,
       "",
-      TEMPLATE_SECTIONS_PHASE_SCHEMA,
+      TEMPLATE_TEXT_FIRST_SCHEMA,
+      TEMPLATE_FIELD_KEY_GUIDANCE,
+      "",
+      "# PDF에서 추출한 본문 (읽기 순서)",
+      plain.slice(0, 14_000),
       "",
       "# 이번 요청",
-      "이미지에서 보이는 모든 주요 섹션·표 블록·첨부 블록의 title만 sections 배열로 나열한다.",
-      "번호가 있으면 title에 포함한다 (예: '1. 인적사항'). leaf·입력 라벨은 넣지 않는다.",
-      "",
-      "출력: JSON만.",
+      "위 본문만 보고 입력란·표의 항목 라벨을 fields 배열로 나열한다.",
+      "일반적인 지원서에는 보통 8개 이상의 서로 다른 항목명이 있다.",
     ].join("\n");
-    const maxTok = Math.min(1536, getVllmTemplateMaxOutputTokens(baseUrl));
-    const parsed = await callVlm(userText, maxTok);
-    const sections = parseSectionsFromVlmParsed(parsed);
-    console.info("[template-analyze] sections phase", { docType, count: sections.length, sections });
-    return sections;
+    const maxTok = Math.min(4096, getVllmTemplateMaxOutputTokens(baseUrl));
+    const parsed = await callLlm(userText, maxTok, false);
+    const result = templateResultFromFieldsParsed(parsed, "textFirst");
+    if (result.fields.length < minFields) {
+      console.warn("[template-analyze] text_first: 필드 수 부족", {
+        got: result.fields.length,
+        need: minFields,
+      });
+      return null;
+    }
+    console.info("[template-analyze] text_first ok", {
+      docType,
+      fieldCount: result.fields.length,
+      sample: result.fields.slice(0, 16),
+    });
+    return result;
   }
 
-  async function runOnce(instruction: string, sectionsBlock = ""): Promise<TemplateAnalysisResult> {
+  async function runVisionSimple(): Promise<TemplateAnalysisResult> {
+    const textHints =
+      pdfAbsPath && pdfTextHintsEnabled() ? extractPdfTextLabelCandidates(pdfAbsPath) : [];
+    const hintsBlock = buildPdfTextHintsBlock(textHints);
+
     const userText = [
       docTypeHint,
       "",
-      TEMPLATE_LAYOUT_HIERARCHY_SCHEMA,
+      TEMPLATE_SIMPLE_VISION_SCHEMA,
       TEMPLATE_FIELD_KEY_GUIDANCE,
       hintsBlock,
-      sectionsBlock,
       "",
       "# 이번 요청",
-      instruction,
-      "",
-      "출력: 위 출력 형식에 맞는 JSON만 한 번 출력한다. 그 외 문장은 쓰지 않는다.",
+      "이미지에서 표·입력란의 짧은 항목 라벨만 fields 배열로 추출한다.",
+      "layout_hierarchy·bbox는 출력하지 않는다.",
     ].join("\n");
 
-    const parsed = await callVlm(userText, getVllmTemplateMaxOutputTokens(baseUrl));
+    const parsed = await callLlm(userText, getVllmTemplateMaxOutputTokens(baseUrl), true);
+    let result = templateResultFromFieldsParsed(parsed, "visionSimple");
 
-    const fromHierarchy = templateResultFromLayoutHierarchy(parsed);
-
-    let summary = String(parsed.summary ?? "").trim();
-    const rawBboxes = parsed.fieldBboxes ?? parsed.field_bboxes ?? parsed.bboxes;
-    let fieldBboxes: TemplateFieldBBox[] = Array.isArray(rawBboxes)
-      ? rawBboxes
-          .map((b) => {
-            if (!b || typeof b !== "object") return null;
-            const obj = b as Record<string, unknown>;
-            const key = String(obj.key ?? obj.label ?? "").trim();
-            if (!key) return null;
-            const san = templateBBoxFromFlatObject(obj);
-            if (!san) return null;
-            const pg = parseNodePageOptional(obj);
-            return { key, ...san, ...(pg !== undefined ? { page: pg } : {}) };
-          })
-          .filter(Boolean) as TemplateFieldBBox[]
-      : [];
-
-    let fields: string[];
-    if (fromHierarchy && fromHierarchy.fields.length > 0) {
-      summary = fromHierarchy.summary || summary;
-      fields = fromHierarchy.fields;
-      const hb = fromHierarchy.fieldBboxes;
-      if (hb && hb.length > 0) {
-        fieldBboxes = hb;
+    if (result.fields.length < minFields) {
+      const legacy = templateResultFromLayoutHierarchy(parsed);
+      if (legacy && legacy.fields.length > result.fields.length) {
+        const { fields } = normalizeSchemaFieldKeys(legacy.fields, "visionHierarchyFallback");
+        result = { fields, summary: legacy.summary, fieldBboxes: legacy.fieldBboxes ?? [] };
       }
-    } else {
-      const rawFieldItems = extractRawFieldsArrayFromParsed(parsed);
-      fields = rawFieldItems.map(normalizeFieldListItem).filter((s): s is string => Boolean(s));
     }
 
-    if (!fields.length && fieldBboxes.length) {
-      const seen = new Set<string>();
-      const fromBbox: string[] = [];
-      for (const b of fieldBboxes) {
-        if (b.key && !seen.has(b.key)) {
-          seen.add(b.key);
-          fromBbox.push(b.key);
-        }
-      }
-      fields = fromBbox;
-    }
-
-    if (!fields.length) {
-      console.warn("[template-analyze] 빈 fields", {
-        parsedTopKeys: Object.keys(parsed),
-        twoStage,
-      });
-    }
-
-    const { fields: normFields } = normalizeSchemaFieldKeys(fields, "analyzeTemplate");
-    fields = normFields;
-    const fieldSet = new Set(fields);
-    fieldBboxes = fieldBboxes
-      .map((b) => {
-        const k = sanitizeFieldKeyCandidate(b.key);
-        if (!k || !fieldSet.has(k)) return null;
-        return { ...b, key: k };
-      })
-      .filter(Boolean) as TemplateFieldBBox[];
-
-    return { fields, summary, fieldBboxes };
+    console.info("[template-analyze] vision simple", {
+      docType,
+      fieldCount: result.fields.length,
+      mode,
+    });
+    return result;
   }
 
-  let sectionsBlock = "";
-  if (twoStage) {
+  if (mode === "text_first" || mode === "auto") {
     try {
-      const sections = await runSectionsPhase();
-      sectionsBlock = buildTemplateSectionsBlock(sections);
+      const textResult = await runTextFirst();
+      if (textResult) return finish(textResult);
     } catch (e) {
-      console.warn("[template-analyze] sections phase failed, fallback to single pass", e);
+      console.warn("[template-analyze] text_first failed", e);
+    }
+    if (mode === "text_first") {
+      console.info("[template-analyze] text_first → vision fallback");
     }
   }
 
-  const leafInstruction = sectionsBlock
-    ? [
-        "2단계: 1단계에서 확정한 섹션 구조를 따른다.",
-        "각 섹션 children 아래에 **입력란 leaf 라벨만** layout_hierarchy로 채운다.",
-        "표의 모든 짧은 항목명(성명, 학번, 지원학과, 생년월일, E-mail 등)을 빠짐없이 leaf로 넣는다.",
-        "섹션 제목만 leaf로 두지 마라. 첨부·서명·귀하·학업계획 빈 칸은 leaf 금지.",
-        "각 leaf bbox는 라벨 글자에만 타이트하게.",
-      ].join("\n")
-    : [
-        "이미지에 있는 모든 표와 블록을 layout_hierarchy 배열로 채운다.",
-        "섹션(예: 1. 인적사항)은 children이 있는 상위 노드로 두고, 입력 칸 옆 라벨은 그 아래 leaf로 둔다.",
-        "섹션 제목만 leaf로 두지 말고, 실제 입력 항목 라벨까지 반드시 포함한다.",
-        "짧은 라벨(생년월일, 과정, 전공, 입학년월, 이메일 등)을 빠짐없이 넣는다.",
-        "각 leaf에 bbox는 라벨 글자에만 타이트하게. 같은 문구가 다른 섹션에 있으면 서로 다른 상위 label 아래에 둔다.",
-      ].join("\n");
-
-  const initial = await runOnce(leafInstruction, sectionsBlock);
-
-  function isBareSectionHeaderField(f: string): boolean {
-    const t = f.trim().replace(/^\d+\.\s*/, "").trim();
-    if (t.includes("_")) return false;
-    if (t === "인적사항" || t === "지도교수" || t === "연구계획") return true;
-    if (t === "학위과정 이수에 대한 연구계획") return true;
-    if (/^학위과정\s*이수에\s*대한\s*연구계획/.test(t)) return true;
-    return false;
-  }
-
-  const isCoarse =
-    initial.fields.length < 8 || initial.fields.some(isBareSectionHeaderField);
-
-  const finish = (r: TemplateAnalysisResult) =>
-    augmentTemplateFieldsFromPdfWordLayer(pdfAbsPath, getVllmTemplateRenderScale(), r);
-
-  if (!isCoarse) return finish(initial);
-
-  if (shouldSkipTemplateCoarseRetry(baseUrl)) {
-    console.info("[template-analyze] skip coarse retry (tunnel or VLLM_SKIP_COARSE_RETRY)");
-    return finish(initial);
-  }
-
-  // 이전 재시도는 initial 필드 전부를 forbidden 처리해 모델이 fields: []만 내는 경우가 많았음(특히 필드 수 < 8일 때).
-  const retry = await runOnce(
-    [
-      "재시도: layout_hierarchy를 처음부터 다시 채운다.",
-      "이전보다 leaf(입력 칸 옆 라벨) 개수를 늘린다. 일반적인 신청서·계획서에는 보통 12개 이상의 항목 라벨이 있다.",
-      "섹션 제목만 나열하지 말고, 각 섹션 아래 표의 모든 셀 라벨을 children과 leaf로 펼친다.",
-      "빠진 bbox가 있으면 leaf마다 채운다.",
-    ].join("\n")
-  );
-
-  if (retry.fields.length > initial.fields.length) return finish(retry);
-  if (initial.fields.length === 0 && retry.fields.length > 0) return finish(retry);
-  if (initial.fields.length < 8 && retry.fields.length > 0 && retry.fields.length >= initial.fields.length) {
-    return finish(retry);
-  }
-  return finish(initial);
+  return finish(await runVisionSimple());
 }
 

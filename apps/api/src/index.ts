@@ -5,7 +5,12 @@ import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { getVllmPdfRenderOptions, getVllmTemplateRenderScale, isVllmTunnelBaseUrl } from "./lib/reanalysis.js";
+import {
+  getTemplateAnalysisMode,
+  getVllmPdfRenderOptions,
+  getVllmTemplateRenderScale,
+  isVllmTunnelBaseUrl,
+} from "./lib/reanalysis.js";
 
 /** `npm run dev:api`를 모노레포 루트에서 실행해도 apps/api/.env가 항상 로드되도록 */
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -61,5 +66,6 @@ app.listen(PORT, () => {
     VLLM_TEMPLATE_RENDER_SCALE: process.env.VLLM_TEMPLATE_RENDER_SCALE ?? getVllmTemplateRenderScale(),
     VLLM_BASE_URL: vllmBase,
     vllm_tunnel: isVllmTunnelBaseUrl(vllmBase),
+    VLLM_TEMPLATE_MODE: process.env.VLLM_TEMPLATE_MODE ?? getTemplateAnalysisMode(),
   });
 });
