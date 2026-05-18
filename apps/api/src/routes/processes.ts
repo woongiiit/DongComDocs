@@ -13,7 +13,7 @@ import type { AuthedRequest } from "../middleware/auth.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import {
   analyzeTemplateWithVllm,
-  getVllmTemplateRenderScale,
+  getVllmTemplatePdfRenderOptions,
   buildTemplateFieldBoxes,
   classifyWithVllm,
   extractFieldsForDocTypeWithVllm,
@@ -482,9 +482,11 @@ router.post("/:id/layout-schemas/:docType/analyze-template", requireAuth, requir
   }
 
   try {
-    const scale = getVllmTemplateRenderScale();
-    const vllmOpts = getVllmPdfRenderOptions();
-    const imageDataUris = renderAllPagesToDataUris(abs, scale, vllmOpts.maxPages, {
+    const vllmOpts = getVllmTemplatePdfRenderOptions();
+    if (process.env.VLLM_BASE_URL) {
+      console.info("[analyze-template] vllm render", vllmOpts);
+    }
+    const imageDataUris = renderAllPagesToDataUris(abs, vllmOpts.scale, vllmOpts.maxPages, {
       maxLongEdgePx: vllmOpts.maxLongEdgePx,
       imageFormat: vllmOpts.imageFormat,
       jpegQuality: vllmOpts.jpegQuality,
@@ -492,8 +494,8 @@ router.post("/:id/layout-schemas/:docType/analyze-template", requireAuth, requir
     const analyzed = await analyzeTemplateWithVllm(imageDataUris, docType, abs);
 
     // 템플릿 단계 bbox 미리보기(1페이지)용 데이터 생성
-    const previewImageDataUri: string = renderFirstPageToDataUri(abs, scale);
-    const fieldBoxes = buildTemplateFieldBoxes(abs, scale, analyzed.fields, analyzed.fieldBboxes ?? [], {
+    const previewImageDataUri: string = renderFirstPageToDataUri(abs, vllmOpts.scale);
+    const fieldBoxes = buildTemplateFieldBoxes(abs, vllmOpts.scale, analyzed.fields, analyzed.fieldBboxes ?? [], {
       pdfPageCount: imageDataUris.length,
     });
 

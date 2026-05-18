@@ -47,18 +47,39 @@ const INSTRUCTION_LIKE_KEY_RE =
 export type FieldKeyPostprocessLog = { raw: string; reason: string; replacement?: string };
 
 function isProbableSentenceFieldKey(s: string): boolean {
-  if (s.length > SOFT_FIELD_KEY_LEN && BOILERPLATE_KEY_RE.test(s)) return true;
+  if (/※|해당시에만|필요시만|이하\s*생략|작성\s*필요/.test(s)) return true;
+  if (BOILERPLATE_KEY_RE.test(s)) return true;
   if (s.length > SOFT_FIELD_KEY_LEN && /[.。?？!！]/.test(s)) return true;
   if (/(습니다|합니다|입니다)(\s|[.。!?]|$)/.test(s) && s.length > 24) return true;
   if (s.length > 20 && INSTRUCTION_LIKE_KEY_RE.test(s)) return true;
   return false;
 }
 
+/** 괄호·※·조건부 안내 접미사 등 필드 키 노이즈 제거 */
+function stripFieldKeyNoise(s: string): string {
+  let t = s.replace(/\s+/g, " ").trim();
+  t = t.replace(/\([^)]{0,120}\)/g, "").replace(/（[^）]{0,120}）/g, "");
+  t = t.replace(/※.*/g, "");
+  const parts = t.split("_").map((part) => {
+    let seg = part.trim();
+    if (!seg) return "";
+    seg = seg.replace(/해당시에만.*/g, "");
+    seg = seg.replace(/필요시(만)?.*/g, "");
+    seg = seg.replace(/작성\s*필요.*/g, "");
+    seg = seg.replace(/이하\s*생략.*/g, "");
+    seg = seg.replace(/진학전공까지확정.*/g, "");
+    if (/(발급|서약서|성적증명|별지|귀하|\d+부)/.test(seg) && seg.length > 10) return "";
+    return seg.trim();
+  });
+  return parts.filter(Boolean).join("_").replace(/_+/g, "_").replace(/^_|_$/g, "").trim();
+}
+
 /**
  * 레이아웃 스키마 필드명 후보 정리. 장문·안내 문장형 키는 제거하거나 짧은 키로 치환.
  */
 export function sanitizeFieldKeyCandidate(raw: string): string | null {
-  let s = raw.replace(/\s+/g, " ").trim().replace(/^[\s._]+|[\s._]+$/g, "");
+  let s = stripFieldKeyNoise(raw);
+  s = s.replace(/^[\s._]+|[\s._]+$/g, "");
   if (!s) return null;
   if (s.length > MAX_FIELD_KEY_LEN) return null;
   if (/^[\d\s\-_.,:;]+$/.test(s)) return null;
@@ -922,7 +943,33 @@ export function getVllmTemplateRenderScale(): number {
     const v = Number(raw);
     if (Number.isFinite(v) && v >= 0.4) return Math.min(v, 4);
   }
-  return Math.min(Math.max(getVllmPdfRenderOptions().scale, 1.2), 3);
+  const base = Math.min(Math.max(getVllmPdfRenderOptions().scale, 1.2), 3);
+  const vllmBase = (process.env.VLLM_BASE_URL ?? "http://localhost:8000").replace(/\/$/, "");
+  if (isVllmTunnelBaseUrl(vllmBase)) return Math.min(base, 1.35);
+  return base;
+}
+
+/** 템플릿 분석 전용 PDF→이미지 옵션(터널 시 페이지·해상도·JPEG 자동 축소). */
+export function getVllmTemplatePdfRenderOptions(): VllmPdfRenderOptions {
+  const base = getVllmPdfRenderOptions();
+  const scale = getVllmTemplateRenderScale();
+  const vllmBase = (process.env.VLLM_BASE_URL ?? "http://localhost:8000").replace(/\/$/, "");
+  if (!isVllmTunnelBaseUrl(vllmBase)) {
+    return { ...base, scale };
+  }
+  return {
+    scale,
+    maxPages: Math.min(base.maxPages, 1),
+    maxLongEdgePx: Math.min(base.maxLongEdgePx > 0 ? base.maxLongEdgePx : 960, 720),
+    imageFormat: "jpeg",
+    jpegQuality: Math.min(base.jpegQuality, 70),
+  };
+}
+
+function getVllmTemplateMaxOutputTokens(baseUrl: string): number {
+  const cap = getVllmMaxOutputTokens();
+  if (!isVllmTunnelBaseUrl(baseUrl)) return cap;
+  return Math.min(cap, 3072);
 }
 
 function shouldSkipTemplateCoarseRetry(baseUrl: string): boolean {
@@ -973,8 +1020,11 @@ async function vllmChatCompletions(baseUrl: string, body: object): Promise<VllmC
     return (await res.json()) as VllmChatCompletionJson;
   } catch (e) {
     if (e instanceof Error && e.name === "AbortError") {
+      const tunnel = isVllmTunnelBaseUrl(baseUrl);
       throw new Error(
-        `vLLM 호출 시간 초과 (${Math.round(timeoutMs / 1000)}초). VLLM_MAX_PDF_PAGES·렌더 스케일을 낮추거나 VLLM_FETCH_TIMEOUT_MS를 늘리세요.`
+        tunnel
+          ? `vLLM 호출 시간 초과 (약 ${Math.round(timeoutMs / 1000)}초). trycloudflare 터널은 응답 대기가 약 100초로 제한됩니다. Railway에 VLLM_MAX_PDF_PAGES=1, VLLM_TEMPLATE_RENDER_SCALE=1.2, PDF_TEXT_HINTS=0 을 설정한 뒤 재시도하세요.`
+          : `vLLM 호출 시간 초과 (${Math.round(timeoutMs / 1000)}초). VLLM_MAX_PDF_PAGES·렌더 스케일을 낮추거나 VLLM_FETCH_TIMEOUT_MS를 늘리세요.`
       );
     }
     throw e;
@@ -1639,6 +1689,9 @@ export async function extractFieldsForDocTypeWithVllm(
 function pdfTextHintsEnabled(): boolean {
   const v = process.env.PDF_TEXT_HINTS?.trim().toLowerCase();
   if (v === "0" || v === "false" || v === "no" || v === "off") return false;
+  if (v === "1" || v === "true" || v === "yes" || v === "on") return true;
+  const vllmBase = (process.env.VLLM_BASE_URL ?? "http://localhost:8000").replace(/\/$/, "");
+  if (isVllmTunnelBaseUrl(vllmBase)) return false;
   return true;
 }
 
@@ -1772,7 +1825,7 @@ export async function analyzeTemplateWithVllm(
     const body = {
       model: modelId,
       temperature: 0.01,
-      max_tokens: getVllmMaxOutputTokens(),
+      max_tokens: getVllmTemplateMaxOutputTokens(baseUrl),
       messages: [
         {
           role: "system",
