@@ -1,0 +1,147 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  STUDENT
+  ADMIN
+}
+
+enum ReanalysisRunStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+model User {
+  id                     String                @id @default(cuid())
+  studentId              String                @unique
+  passwordHash           String
+  role                   Role                  @default(STUDENT)
+  createdAt              DateTime              @default(now())
+  submissions            Submission[]
+  processesCreated       Process[]             @relation("ProcessCreator")
+  uploadCancleHistories  UploadCancleHistory[]
+  reanalysisRunsCreated  ProcessReanalysisRun[] @relation("ReanalysisRunCreator")
+  announcementsCreated   Announcement[]        @relation("AnnouncementCreator")
+}
+
+/// 관리자가 등록하는 공지사항 (학생 홈/관리자 페이지 공통 조회)
+model Announcement {
+  id          String   @id @default(cuid())
+  title       String
+  content     String
+  pinned      Boolean  @default(false)
+  createdById String
+  createdBy   User     @relation("AnnouncementCreator", fields: [createdById], references: [id])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([pinned, createdAt])
+}
+
+model Process {
+  id              String                  @id @default(cuid())
+  title           String
+  description     String?
+  /// YYYY-MM-DD (서울 달력 기준, inclusive). null이면 시작 제한 없음
+  startDate       String?
+  /// YYYY-MM-DD (inclusive). null이면 종료 제한 없음
+  endDate         String?
+  rulesJson       Json
+  active          Boolean                 @default(true)
+  createdById     String
+  createdBy       User                    @relation("ProcessCreator", fields: [createdById], references: [id])
+  createdAt       DateTime                @default(now())
+  submissions     Submission[]
+  reanalysisRuns  ProcessReanalysisRun[]
+  layoutSchemas   ProcessLayoutSchema[]
+}
+
+model Submission {
+  id        String            @id @default(cuid())
+  processId String
+  process   Process           @relation(fields: [processId], references: [id])
+  userId    String
+  user      User              @relation(fields: [userId], references: [id])
+  status    String            @default("RECEIVED")
+  createdAt DateTime          @default(now())
+  files     SubmissionFile[]
+}
+
+model SubmissionFile {
+  id                      String                       @id @default(cuid())
+  submissionId            String
+  submission              Submission                   @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  originalName            String
+  storedPath              String
+  mimeType                String?
+  formSlotIndex           Int?
+  formDocType             String?
+  createdAt               DateTime                     @default(now())
+  docTypeClassifications  SubmissionFileDocTypeResult[]
+}
+
+/// 제출 취소 감사 로그 (제출 행 삭제 후에도 submissionId·스냅샷 보관)
+model UploadCancleHistory {
+  id             String   @id @default(cuid())
+  submissionId   String
+  userId         String
+  user           User     @relation(fields: [userId], references: [id])
+  previousStatus String
+  snapshotJson   Json
+  createdAt      DateTime @default(now())
+
+  @@map("UploadCancleHistory")
+}
+
+/// 관리자 확정 레이아웃 스키마 (docType별)
+model ProcessLayoutSchema {
+  id         String   @id @default(cuid())
+  processId  String
+  process    Process  @relation(fields: [processId], references: [id], onDelete: Cascade)
+  docType    String
+  schemaJson Json
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([processId, docType])
+}
+
+/// 재분석 실행 이력 (버튼 클릭 1회 = run 1개)
+model ProcessReanalysisRun {
+  id                   String                        @id @default(cuid())
+  processId            String
+  process              Process                       @relation(fields: [processId], references: [id], onDelete: Cascade)
+  status               ReanalysisRunStatus          @default(RUNNING)
+  schemaSnapshotJson   Json
+  totalFiles          Int                          @default(0)
+  processedFiles      Int                          @default(0)
+  errorMessage         String?
+  createdById          String
+  createdBy            User                          @relation("ReanalysisRunCreator", fields: [createdById], references: [id])
+  createdAt            DateTime                      @default(now())
+  finishedAt           DateTime?
+  fileClassifications  SubmissionFileDocTypeResult[]
+}
+
+/// run별 문서(docType) 분류 + 필드 추출 결과
+model SubmissionFileDocTypeResult {
+  id                   String               @id @default(cuid())
+  runId                String
+  run                  ProcessReanalysisRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  submissionFileId     String
+  submissionFile       SubmissionFile       @relation(fields: [submissionFileId], references: [id], onDelete: Cascade)
+  docType              String
+  confidence           Float
+  extractedFieldsJson  Json
+  createdAt            DateTime             @default(now())
+
+  @@index([runId, docType])
+  @@index([submissionFileId])
+}
