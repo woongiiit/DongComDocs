@@ -7,6 +7,7 @@ import {
   type ProcessListItem,
 } from "../../api";
 import AdminWorkflowShell from "../../components/AdminWorkflowShell";
+import SchemaFieldEditorSection from "../../components/admin/SchemaFieldEditorSection";
 
 type EditableSchema = {
   docType: string;
@@ -74,6 +75,12 @@ function rectShort(r: DOMRectReadOnly): { w: number; h: number } {
   return { w: round2(r.width), h: round2(r.height) };
 }
 
+const BBOX_CHIP_COLORS = ["#2563eb", "#16a34a", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4"];
+
+function fieldsSnapshotEqual(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
 /** 정규화 박스가 0~1 밖으로 나가는지·극단 비율인지 요약 (모델/좌표 이상 탐지) */
 function summarizeNormBoxes(boxes: FieldBox[]) {
   const vis = boxes.filter((b) => b.w > 0.001 && b.h > 0.001);
@@ -107,8 +114,13 @@ function isTemplateBboxUiDebug(): boolean {
   }
 }
 
-function TemplateBboxPreview(props: { docType: string; imageDataUri: string; fieldBoxes: FieldBox[] }) {
-  const { docType, imageDataUri, fieldBoxes } = props;
+function TemplateBboxPreview(props: {
+  docType: string;
+  imageDataUri: string;
+  fieldBoxes: FieldBox[];
+  highlightKey?: string | null;
+}) {
+  const { docType, imageDataUri, fieldBoxes, highlightKey = null } = props;
   const wrapRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
@@ -221,8 +233,9 @@ function TemplateBboxPreview(props: { docType: string; imageDataUri: string; fie
         {fieldBoxes
           .filter((b) => b.w > 0.001 && b.h > 0.001)
           .map((b, idx) => {
-            const colors = ["#2563eb", "#16a34a", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4"];
-            const color = colors[idx % colors.length];
+            const color = BBOX_CHIP_COLORS[idx % BBOX_CHIP_COLORS.length];
+            const isHighlight = highlightKey === b.key;
+            const dimmed = highlightKey != null && highlightKey !== "" && !isHighlight;
             const tip = `${b.key} · ${b.bboxSource ?? "?"} · matchCount=${b.matchCount}${b.matchedWord ? ` · 단어:${b.matchedWord}` : ""}`;
             return (
               <rect
@@ -231,9 +244,10 @@ function TemplateBboxPreview(props: { docType: string; imageDataUri: string; fie
                 y={b.y}
                 width={b.w}
                 height={b.h}
-                fill="rgba(37,99,235,0.08)"
+                fill={isHighlight ? "rgba(37,99,235,0.18)" : "rgba(37,99,235,0.08)"}
                 stroke={color}
-                strokeWidth={0.004}
+                strokeWidth={isHighlight ? 0.007 : 0.004}
+                opacity={dimmed ? 0.35 : 1}
                 style={{ pointerEvents: "auto" }}
               >
                 <title>{tip}</title>
@@ -260,6 +274,8 @@ export default function AdminProcessLayoutAnalysis() {
   const [templatePreviews, setTemplatePreviews] = useState<Record<string, { imageDataUri: string; fieldBoxes: FieldBox[] }>>(
     {}
   );
+  const [baselineFields, setBaselineFields] = useState<Record<string, string[]>>({});
+  const [hoveredFieldByDocType, setHoveredFieldByDocType] = useState<Record<string, string | null>>({});
 
   useEffect(() => {
     (async () => {
@@ -278,15 +294,16 @@ export default function AdminProcessLayoutAnalysis() {
     setNotice(null);
     try {
       const sc = await apiFetch<ProcessLayoutSchema[]>(`/api/processes/${targetId}/layout-schemas`);
-      setSchemas(
-        sc.map((x) => ({
-          docType: x.docType,
-          fields: fieldsFromSchema(x.schemaJson),
-          newField: "",
-          templateOriginalName: x.templateOriginalName ?? null,
-          analysisSummary: x.analysisSummary ?? null,
-        }))
-      );
+      const mapped = sc.map((x) => ({
+        docType: x.docType,
+        fields: fieldsFromSchema(x.schemaJson),
+        newField: "",
+        templateOriginalName: x.templateOriginalName ?? null,
+        analysisSummary: x.analysisSummary ?? null,
+      }));
+      setSchemas(mapped);
+      setBaselineFields(Object.fromEntries(mapped.map((x) => [x.docType, [...x.fields]])));
+      setHoveredFieldByDocType({});
     } catch (e) {
       setError(e instanceof Error ? e.message : "불러오기 실패");
     } finally {
@@ -451,149 +468,70 @@ export default function AdminProcessLayoutAnalysis() {
             {!schemas.length && !loading ? (
               <p className="muted">등록된 docType이 없습니다. 프로세스 생성 시 양식명을 먼저 입력하세요.</p>
             ) : null}
-            {schemas.map((s, idx) => (
-              <div key={s.docType} style={{ marginBottom: "1rem", borderTop: "1px solid #e4e4e7", paddingTop: "0.8rem" }}>
-                <label htmlFor={`field-add-${idx}`}>{s.docType} 필드 목록</label>
-                <div className="row" style={{ marginBottom: "0.5rem" }}>
-                  <input
-                    id={`field-add-${idx}`}
-                    type="text"
-                    placeholder="필드명 입력 후 추가 (예: studentId)"
-                    value={s.newField}
-                    onChange={(e) => updateNewField(s.docType, e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        addField(s.docType);
-                      }
-                    }}
-                    style={{ flex: 1, minWidth: "260px" }}
-                  />
-                  <button type="button" className="btn secondary" onClick={() => addField(s.docType)}>
-                    필드 추가
-                  </button>
-                </div>
-                {s.fields.length ? (
-                  <div className="row" style={{ gap: "0.5rem", marginBottom: "0.5rem" }}>
-                    {s.fields.map((f, fIdx) => (
-                      <span
-                        key={`${s.docType}-${f}-${fIdx}`}
+            {schemas.map((s, idx) => {
+              const previewBoxes = templatePreviews[s.docType]?.fieldBoxes ?? [];
+              const hasPreview = Boolean(templatePreviews[s.docType]);
+              const isDirty = !fieldsSnapshotEqual(s.fields, baselineFields[s.docType] ?? []);
+              const hoveredField = hoveredFieldByDocType[s.docType] ?? null;
+              const sectionId = `schema-heading-${idx}`;
+
+              return (
+                <SchemaFieldEditorSection
+                  key={s.docType}
+                  docType={s.docType}
+                  sectionId={sectionId}
+                  fields={s.fields}
+                  newField={s.newField}
+                  isDirty={isDirty}
+                  previewBoxes={previewBoxes}
+                  hasPreview={hasPreview}
+                  hoveredField={hoveredField}
+                  saving={savingDocType === s.docType}
+                  uploading={templateUploading === s.docType}
+                  analyzing={templateAnalyzing === s.docType}
+                  savedFlash={savedDocType === s.docType}
+                  templateOriginalName={s.templateOriginalName}
+                  analysisSummary={s.analysisSummary}
+                  onNewFieldChange={(v) => updateNewField(s.docType, v)}
+                  onAddField={() => addField(s.docType)}
+                  onRemoveField={(fIdx) => removeField(s.docType, fIdx)}
+                  onHoverField={(f) => setHoveredFieldByDocType((prev) => ({ ...prev, [s.docType]: f }))}
+                  onUploadTemplate={(file) => void uploadTemplate(s.docType, file)}
+                  onAnalyzeTemplate={() => void analyzeTemplate(s.docType)}
+                  onSave={() => void saveSchema(s.docType)}
+                >
+                  {hasPreview ? (
+                    <div style={{ marginTop: "0.65rem" }}>
+                      <div className="muted" style={{ fontSize: "0.82rem", marginBottom: "0.25rem" }}>
+                        bbox 미리보기(템플릿)
+                        {import.meta.env.DEV ? (
+                          <span style={{ display: "block", marginTop: "0.2rem", opacity: 0.85 }}>
+                            콘솔: <code>[template-bbox-layout]</code> 정렬 OK · <code>[template-bbox-mismatch]</code>{" "}
+                            이미지≠SVG 픽셀. 프로덕션은 <code>localStorage.DEBUG_TEMPLATE_BBOX_UI=1</code> 후 새로고침.
+                          </span>
+                        ) : null}
+                      </div>
+                      <div
                         style={{
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: "0.4rem",
-                          padding: "0.2rem 0.5rem",
-                          border: "1px solid #d4d4d8",
-                          borderRadius: "999px",
-                          background: "#fafafa",
-                          fontSize: "0.84rem",
+                          border: "1px solid #e4e4e7",
+                          borderRadius: 10,
+                          overflow: "hidden",
+                          maxWidth: "100%",
+                          width: "fit-content",
                         }}
                       >
-                        {f}
-                        <button
-                          type="button"
-                          className="btn secondary"
-                          style={{ padding: "0.1rem 0.4rem", borderRadius: "999px" }}
-                          onClick={() => removeField(s.docType, fIdx)}
-                        >
-                          ×
-                        </button>
-                      </span>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="muted" style={{ marginTop: 0, marginBottom: "0.5rem", fontSize: "0.82rem" }}>
-                    아직 필드가 없습니다.
-                  </p>
-                )}
-                <div className="row" style={{ marginTop: "0.35rem" }}>
-                  <label className="btn secondary" style={{ cursor: "pointer" }}>
-                    템플릿 PDF 업로드
-                    <input
-                      type="file"
-                      accept="application/pdf"
-                      style={{ display: "none" }}
-                      onChange={(e) => {
-                        const f = e.target.files?.[0];
-                        if (f) void uploadTemplate(s.docType, f);
-                        e.currentTarget.value = "";
-                      }}
-                    />
-                  </label>
-                  <button
-                    type="button"
-                    className="btn secondary"
-                    onClick={() => void analyzeTemplate(s.docType)}
-                    disabled={templateAnalyzing === s.docType}
-                  >
-                    {templateAnalyzing === s.docType ? "분석 중…" : "템플릿 분석"}
-                  </button>
-                  <button
-                    type="button"
-                    className="btn secondary"
-                    onClick={() => void saveSchema(s.docType)}
-                    disabled={savingDocType === s.docType || templateUploading === s.docType}
-                  >
-                    {savingDocType === s.docType
-                      ? "저장 중…"
-                      : savedDocType === s.docType
-                        ? "저장됨 ✓"
-                        : `${s.docType} 저장`}
-                  </button>
-                </div>
-                {savedDocType === s.docType ? (
-                  <p style={{ margin: "0.35rem 0 0", color: "#15803d", fontSize: "0.83rem" }}>
-                    저장 완료: 이 스키마로 재분석을 실행할 수 있습니다.
-                  </p>
-                ) : null}
-                {templateUploading === s.docType ? (
-                  <p className="muted" style={{ margin: "0.35rem 0 0", fontSize: "0.82rem" }}>
-                    템플릿 업로드 중…
-                  </p>
-                ) : null}
-                {s.templateOriginalName ? (
-                  <p className="muted" style={{ margin: "0.35rem 0 0", fontSize: "0.82rem" }}>
-                    템플릿 업로드됨: <strong>{s.templateOriginalName}</strong>
-                  </p>
-                ) : null}
-                {s.analysisSummary ? (
-                  <p className="muted" style={{ margin: "0.25rem 0 0", fontSize: "0.82rem" }}>
-                    분석 요약: {s.analysisSummary}
-                  </p>
-                ) : null}
-
-                {templatePreviews[s.docType] ? (
-                  <div style={{ marginTop: "0.65rem" }}>
-                    <div className="muted" style={{ fontSize: "0.82rem", marginBottom: "0.25rem" }}>
-                      bbox 미리보기(템플릿)
-                      {import.meta.env.DEV ? (
-                        <span style={{ display: "block", marginTop: "0.2rem", opacity: 0.85 }}>
-                          콘솔: <code>[template-bbox-layout]</code> 정렬 OK · <code>[template-bbox-mismatch]</code> 이미지≠SVG
-                          픽셀. 프로덕션은 <code>localStorage.DEBUG_TEMPLATE_BBOX_UI=1</code> 후 새로고침.
-                        </span>
-                      ) : null}
+                        <TemplateBboxPreview
+                          docType={s.docType}
+                          imageDataUri={templatePreviews[s.docType]!.imageDataUri}
+                          fieldBoxes={previewBoxes}
+                          highlightKey={hoveredField}
+                        />
+                      </div>
                     </div>
-                    {/* 테두리는 바깥만: 안쪽은 이미지+오버레이가 같은 박스를 쓰도록 해 % 기준 어긋남을 줄임 */}
-                    <div
-                      style={{
-                        border: "1px solid #e4e4e7",
-                        borderRadius: 10,
-                        overflow: "hidden",
-                        maxWidth: "100%",
-                        width: "fit-content",
-                      }}
-                    >
-                      {/* viewBox 0~1: strokeWidth는 사용자 단위(전체=1). 2면 선만으로 화면 전체를 덮음 → 0.003~0.006 수준 */}
-                      <TemplateBboxPreview
-                        docType={s.docType}
-                        imageDataUri={templatePreviews[s.docType].imageDataUri}
-                        fieldBoxes={templatePreviews[s.docType].fieldBoxes}
-                      />
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            ))}
+                  ) : null}
+                </SchemaFieldEditorSection>
+              );
+            })}
           </div>
 
         </>
