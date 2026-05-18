@@ -68,6 +68,7 @@ function stripFieldKeyNoise(s: string): string {
     seg = seg.replace(/작성\s*필요.*/g, "");
     seg = seg.replace(/이하\s*생략.*/g, "");
     seg = seg.replace(/진학전공까지확정.*/g, "");
+    seg = seg.replace(/등$/g, "");
     if (/(발급|서약서|성적증명|별지|귀하|\d+부)/.test(seg) && seg.length > 10) return "";
     return seg.trim();
   });
@@ -118,6 +119,9 @@ export function normalizeSchemaFieldKeys(
       continue;
     } else if (shouldSkipFieldBboxPreview(candidate)) {
       log.push({ raw: base, reason: "non_input_label_reject" });
+      continue;
+    } else if (fieldKeyStrictEnabled() && !isLikelyInputFieldLabel(candidate)) {
+      log.push({ raw: base, reason: "unlikely_input_label_reject" });
       continue;
     }
 
@@ -586,6 +590,27 @@ function remapFieldKeyByWords(key: string, wordNormSet: Set<string>): string {
   return key;
 }
 
+function fieldKeyStrictEnabled(): boolean {
+  const v = process.env.VLLM_FIELD_KEY_STRICT?.trim().toLowerCase();
+  return v !== "0" && v !== "false" && v !== "no" && v !== "off";
+}
+
+/** 표·입력란 옆 짧은 라벨로 보이는지 (범용 정형문서) */
+function isLikelyInputFieldLabel(key: string): boolean {
+  if (shouldSkipFieldBboxPreview(key)) return false;
+  if (isProbableSentenceFieldKey(key)) return false;
+  const tail = fieldKeyTailForMatch(key).replace(/\s+/g, "");
+  if (!tail || tail.length < 2 || tail.length > 28) return false;
+  if (/[,，;；]/.test(tail)) return false;
+  if (/등$/.test(tail) && tail.length > 5) return false;
+  if (/^\d{3,}/.test(tail)) return false;
+  if (/^(본인은|다음을|위와같이|첨부|학업계획|연구계획)/.test(tail)) return false;
+  if (/^[A-Za-z0-9][A-Za-z0-9.@+\-]{0,18}$/.test(tail)) return true;
+  const hangul = (tail.match(/[\uac00-\ud7a3]/g) || []).length;
+  if (hangul >= 2 && hangul >= tail.length * 0.45) return true;
+  return false;
+}
+
 /** VLM이 반환한 0~1 bbox가 입력란 라벨보다 큰 빈 칸·본문 블록인지 */
 function isOversizedTemplateVlmBBox(w: number, h: number): boolean {
   const area = w * h;
@@ -1013,6 +1038,14 @@ function shouldSkipTemplateCoarseRetry(baseUrl: string): boolean {
   return isVllmTunnelBaseUrl(baseUrl);
 }
 
+/** 1단계 섹션 구조 → 2단계 leaf 추출 (터널·단일 패스 설정 시 비활성) */
+function shouldUseTemplateTwoStage(baseUrl: string): boolean {
+  const flag = process.env.VLLM_TEMPLATE_TWO_STAGE?.trim().toLowerCase();
+  if (flag === "0" || flag === "false" || flag === "no" || flag === "off") return false;
+  if (flag === "1" || flag === "true" || flag === "yes" || flag === "on") return true;
+  return !isVllmTunnelBaseUrl(baseUrl);
+}
+
 function getVllmFetchTimeoutMs(baseUrl: string): number {
   const raw = process.env.VLLM_FETCH_TIMEOUT_MS?.trim();
   const n = raw ? Number(raw) : NaN;
@@ -1415,14 +1448,19 @@ function templateResultFromLayoutHierarchy(parsed: Record<string, unknown>): Tem
   }
 
   function pushField(section: string, cellLabel: string, bbox: unknown, node: Record<string, unknown>): void {
-    const key = makeFieldKey(section, cellLabel);
+    const cell = stripFieldKeyNoise(cellLabel.trim());
+    if (!cell) return;
+    const key = makeFieldKey(section, cell.replace(/\s+/g, ""));
     if (!key) return;
-    fields.push(key);
+    const sk = sanitizeFieldKeyCandidate(key);
+    if (!sk) return;
+    if (fieldKeyStrictEnabled() && !isLikelyInputFieldLabel(sk)) return;
+    fields.push(sk);
     const raw = bboxXminYminXmaxYmaxToNorm(bbox);
     const bb = raw ? sanitizeTemplateBBoxNorm(raw.x, raw.y, raw.w, raw.h) : null;
     const pg = parseNodePageOptional(node);
     if (bb && !isOversizedTemplateVlmBBox(bb.w, bb.h)) {
-      fieldBboxes.push({ key, ...bb, ...(pg !== undefined ? { page: pg } : {}) });
+      fieldBboxes.push({ key: sk, ...bb, ...(pg !== undefined ? { page: pg } : {}) });
     }
   }
 
@@ -1464,11 +1502,53 @@ function templateResultFromLayoutHierarchy(parsed: Record<string, unknown>): Tem
   return { fields, summary, fieldBboxes };
 }
 
+const TEMPLATE_LEAF_DEFINITION = [
+  "# leaf(입력 항목) 정의 — 반드시 준수",
+  "- **leaf**: 사용자가 값을 적거나 선택하는 칸 **바로 옆·위**에 인쇄된 **짧은 항목명**(2~12자 내외)만.",
+  "- **leaf 금지**: 빈 사각형 전체, 학업계획·연구계획 본문 칸, 첨부 목록 문장, 날짜·서명란, 「○○ 귀하」, 법적 고지·확인 문장 전체.",
+  "- 표에서는 **열 헤더·행 라벨**(성명, 학번, E-mail, 지원학과)만 leaf. 셀 안 안내 문구·'1부'·'발급본'은 leaf 아님.",
+].join("\n");
+
+const TEMPLATE_FEW_SHOT_EXAMPLES = [
+  "# 올바른/잘못된 예 (한국어 지원·신청서)",
+  "- 좋음: content=\"성명\", label=\"인적사항\", children 아래 leaf, bbox는 '성명' 글자만 타이트.",
+  "- 좋음: content=\"지원학과\", content=\"학번\" — 서로 다른 leaf.",
+  "- 나쁨: content=\"해당시에만 기재\", content=\"※ 필요시 별지 사용\" — 안내 문구.",
+  "- 나쁨: bbox가 학업계획 빈 칸 전체나 첨부 블록 전체를 덮음.",
+  "- 나쁨: 섹션 제목만 leaf로 두고 표 안 라벨(생년월일, 전공) 누락.",
+].join("\n");
+
+const TEMPLATE_BBOX_PIPELINE_NOTE = [
+  "# bbox (좌표) 규칙",
+  "- 최종 위치는 서버가 PDF 텍스트 레이어로 보정한다. 그래도 **라벨 글자**에 맞는 작은 bbox를 주는 것이 좋다.",
+  "- 빈 입력 칸·본문 영역 전체를 bbox로 넣지 마라.",
+].join("\n");
+
+/** 1단계: 섹션·표 블록만 (leaf 없음) */
+const TEMPLATE_SECTIONS_PHASE_SCHEMA = [
+  "# 1단계 과제",
+  "이미지에서 **섹션·표 블록 제목만** 추출한다. 입력 항목(leaf) 라벨은 이 단계에서 넣지 않는다.",
+  "",
+  "# 1단계 출력 (JSON만)",
+  "- document_type: 문자열",
+  "- sections: 배열. 각 원소 객체:",
+  "  - title: 문자열 (예: '1. 인적사항', '지원구분', '첨부')",
+  "  - page: 정수 (첫 이미지=1)",
+  "  - kind: 문자열 — table | form_block | text_block | attachment 중 하나",
+  "layout_hierarchy는 이 단계에서 **비우거나 생략**한다.",
+].join("\n");
+
 /** 템플릿 분석 1차·재시도 공통: 계층 JSON 스키마 안내 (내부에서 layout_hierarchy → fields 변환) */
 const TEMPLATE_LAYOUT_HIERARCHY_SCHEMA = [
   "# 역할",
   "너는 복잡한 정형 문서의 레이아웃을 분석하고, 시각적 정보와 텍스트 정보를 결합하여 데이터 스키마를 설계하는 전문가다.",
   "문서가 한국어이면 보이는 글자를 한국어 그대로 옮기고, 번역하지 않는다.",
+  "",
+  TEMPLATE_LEAF_DEFINITION,
+  "",
+  TEMPLATE_FEW_SHOT_EXAMPLES,
+  "",
+  TEMPLATE_BBOX_PIPELINE_NOTE,
   "",
   "# 과제",
   "제공된 이미지에서 문서 구조를 분석하여, 요소 간 계층 관계가 담긴 JSON 스키마를 추출한다.",
@@ -1511,6 +1591,65 @@ const TEMPLATE_FIELD_KEY_GUIDANCE = [
   "- \"다음을 확인\", \"※\", \"주의\", \"본인은\", \"확인 후\" 등으로 시작하는 **장문**은 필드 키 후보에서 제외한다.",
   "- 표에서 **짧은 열 헤더·항목 라벨**(예: 성명, 학번, E-mail)을 우선한다. 빈 입력칸이면 value는 \"\"로 둔다.",
 ].join("\n");
+
+function buildTemplateDocTypeHint(docType: string): string {
+  const dt = docType.trim();
+  if (!dt) return "";
+  return [
+    "",
+    "# 문서 맥락 (시스템)",
+    `이 양식의 종류/코드: ${dt}`,
+    "대학·기관의 지원서·신청서·계획서·확인서 등 정형 PDF일 가능성이 높다. 표·입력란 중심으로 leaf를 찾는다.",
+  ].join("\n");
+}
+
+function buildTemplateSectionsBlock(sections: string[]): string {
+  if (!sections.length) return "";
+  return [
+    "",
+    "# 확정된 섹션 구조 (1단계 결과)",
+    "아래 제목을 layout_hierarchy의 **상위 섹션 label**로 그대로 사용하고, 각 섹션 children 아래에만 leaf를 넣는다.",
+    ...sections.map((s) => `- ${s}`),
+    "위 목록에 없는 이름으로 임의 섹션을 새로 만들지 마라.",
+  ].join("\n");
+}
+
+function parseSectionsFromVlmParsed(parsed: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (t: string) => {
+    const s = t.replace(/\s+/g, " ").trim();
+    if (!s || s.length > 80 || seen.has(s)) return;
+    seen.add(s);
+    out.push(s);
+  };
+
+  const rawSections = parsed.sections;
+  if (Array.isArray(rawSections)) {
+    for (const item of rawSections) {
+      if (typeof item === "string") push(item);
+      else if (item && typeof item === "object") {
+        const o = item as Record<string, unknown>;
+        push(String(o.title ?? o.label ?? o.name ?? ""));
+      }
+    }
+  }
+
+  if (!out.length) {
+    const lh = parsed.layout_hierarchy ?? parsed.layoutHierarchy;
+    if (Array.isArray(lh)) {
+      for (const item of lh) {
+        if (!item || typeof item !== "object") continue;
+        const o = item as Record<string, unknown>;
+        const kids = o.children;
+        if (Array.isArray(kids) && kids.length > 0) {
+          push(String(o.label ?? o.content ?? ""));
+        }
+      }
+    }
+  }
+  return out;
+}
 
 function tryParseJsonContent(text: string): Record<string, unknown> | null {
   const raw = stripVlNoise(text).trim();
@@ -1838,31 +1977,18 @@ export async function analyzeTemplateWithVllm(
   }
 
   const hintsBlock = buildPdfTextHintsBlock(textHints);
+  const docTypeHint = buildTemplateDocTypeHint(docType);
+  const twoStage = shouldUseTemplateTwoStage(baseUrl);
 
-  async function runOnce(instruction: string): Promise<TemplateAnalysisResult> {
+  async function callVlm(userText: string, maxTokens: number): Promise<Record<string, unknown>> {
     const promptContent = [
-      {
-        type: "text",
-        text: [
-          `문서 종류 코드(참고, 시스템용): ${docType}`,
-          "",
-          TEMPLATE_LAYOUT_HIERARCHY_SCHEMA,
-          TEMPLATE_FIELD_KEY_GUIDANCE,
-          hintsBlock,
-          "",
-          "# 이번 요청",
-          instruction,
-          "",
-          "출력: 위 출력 형식에 맞는 JSON만 한 번 출력한다. 그 외 문장은 쓰지 않는다.",
-        ].join("\n"),
-      },
+      { type: "text", text: userText },
       ...imageDataUris.map((url) => ({ type: "image_url", image_url: { url } })),
     ];
-
     const body = {
       model: modelId,
       temperature: 0.01,
-      max_tokens: getVllmTemplateMaxOutputTokens(baseUrl),
+      max_tokens: maxTokens,
       messages: [
         {
           role: "system",
@@ -1874,11 +2000,46 @@ export async function analyzeTemplateWithVllm(
         { role: "user", content: promptContent },
       ],
     };
-
     const data = await vllmChatCompletions(baseUrl, body);
-    const choice0 = data.choices?.[0];
-    const responseText = chatCompletionContentToString(choice0?.message?.content);
-    const parsed = tryParseJsonContent(responseText) ?? {};
+    const responseText = chatCompletionContentToString(data.choices?.[0]?.message?.content);
+    return tryParseJsonContent(responseText) ?? {};
+  }
+
+  async function runSectionsPhase(): Promise<string[]> {
+    const userText = [
+      docTypeHint,
+      "",
+      TEMPLATE_SECTIONS_PHASE_SCHEMA,
+      "",
+      "# 이번 요청",
+      "이미지에서 보이는 모든 주요 섹션·표 블록·첨부 블록의 title만 sections 배열로 나열한다.",
+      "번호가 있으면 title에 포함한다 (예: '1. 인적사항'). leaf·입력 라벨은 넣지 않는다.",
+      "",
+      "출력: JSON만.",
+    ].join("\n");
+    const maxTok = Math.min(1536, getVllmTemplateMaxOutputTokens(baseUrl));
+    const parsed = await callVlm(userText, maxTok);
+    const sections = parseSectionsFromVlmParsed(parsed);
+    console.info("[template-analyze] sections phase", { docType, count: sections.length, sections });
+    return sections;
+  }
+
+  async function runOnce(instruction: string, sectionsBlock = ""): Promise<TemplateAnalysisResult> {
+    const userText = [
+      docTypeHint,
+      "",
+      TEMPLATE_LAYOUT_HIERARCHY_SCHEMA,
+      TEMPLATE_FIELD_KEY_GUIDANCE,
+      hintsBlock,
+      sectionsBlock,
+      "",
+      "# 이번 요청",
+      instruction,
+      "",
+      "출력: 위 출력 형식에 맞는 JSON만 한 번 출력한다. 그 외 문장은 쓰지 않는다.",
+    ].join("\n");
+
+    const parsed = await callVlm(userText, getVllmTemplateMaxOutputTokens(baseUrl));
 
     const fromHierarchy = templateResultFromLayoutHierarchy(parsed);
 
@@ -1925,11 +2086,9 @@ export async function analyzeTemplateWithVllm(
     }
 
     if (!fields.length) {
-      const keys = Object.keys(parsed);
       console.warn("[template-analyze] 빈 fields", {
-        finishReason: choice0?.finish_reason,
-        parsedTopKeys: keys,
-        contentHead: responseText.slice(0, 500),
+        parsedTopKeys: Object.keys(parsed),
+        twoStage,
       });
     }
 
@@ -1947,15 +2106,33 @@ export async function analyzeTemplateWithVllm(
     return { fields, summary, fieldBboxes };
   }
 
-  const initial = await runOnce(
-    [
-      "이미지에 있는 모든 표와 블록을 layout_hierarchy 배열로 채운다.",
-      "섹션(예: 1. 인적사항, 2. 지도교수)은 children이 있는 상위 노드로 두고, 입력 칸 옆 라벨은 그 아래 leaf로 둔다.",
-      "섹션 제목만 leaf로 두지 말고, 실제 입력 항목 라벨까지 반드시 포함한다.",
-      "짧은 라벨(생년월일, 과정, 전공, 입학년월, 이메일 등)을 빠짐없이 넣는다.",
-      "각 leaf에 bbox를 넣는다. 같은 문구가 다른 섹션에 있으면 서로 다른 상위 label 아래에 둔다.",
-    ].join("\n")
-  );
+  let sectionsBlock = "";
+  if (twoStage) {
+    try {
+      const sections = await runSectionsPhase();
+      sectionsBlock = buildTemplateSectionsBlock(sections);
+    } catch (e) {
+      console.warn("[template-analyze] sections phase failed, fallback to single pass", e);
+    }
+  }
+
+  const leafInstruction = sectionsBlock
+    ? [
+        "2단계: 1단계에서 확정한 섹션 구조를 따른다.",
+        "각 섹션 children 아래에 **입력란 leaf 라벨만** layout_hierarchy로 채운다.",
+        "표의 모든 짧은 항목명(성명, 학번, 지원학과, 생년월일, E-mail 등)을 빠짐없이 leaf로 넣는다.",
+        "섹션 제목만 leaf로 두지 마라. 첨부·서명·귀하·학업계획 빈 칸은 leaf 금지.",
+        "각 leaf bbox는 라벨 글자에만 타이트하게.",
+      ].join("\n")
+    : [
+        "이미지에 있는 모든 표와 블록을 layout_hierarchy 배열로 채운다.",
+        "섹션(예: 1. 인적사항)은 children이 있는 상위 노드로 두고, 입력 칸 옆 라벨은 그 아래 leaf로 둔다.",
+        "섹션 제목만 leaf로 두지 말고, 실제 입력 항목 라벨까지 반드시 포함한다.",
+        "짧은 라벨(생년월일, 과정, 전공, 입학년월, 이메일 등)을 빠짐없이 넣는다.",
+        "각 leaf에 bbox는 라벨 글자에만 타이트하게. 같은 문구가 다른 섹션에 있으면 서로 다른 상위 label 아래에 둔다.",
+      ].join("\n");
+
+  const initial = await runOnce(leafInstruction, sectionsBlock);
 
   function isBareSectionHeaderField(f: string): boolean {
     const t = f.trim().replace(/^\d+\.\s*/, "").trim();
